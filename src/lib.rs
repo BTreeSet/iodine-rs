@@ -6,3 +6,4 @@ pub mod fw_query;
 pub mod login;
 pub mod server;
 pub mod tun;
+pub mod user;
