@@ -1,4 +1,13 @@
+use data_encoding::{Encoding, Specification};
+
 const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz012345";
+
+fn encoding() -> Encoding {
+    let mut spec = Specification::new();
+    spec.symbols.push_str("abcdefghijklmnopqrstuvwxyz012345");
+    spec.padding = None;
+    spec.encoding().expect("valid base32 specification")
+}
 
 fn rev32(byte: u8) -> u8 {
     match byte {
@@ -7,6 +16,18 @@ fn rev32(byte: u8) -> u8 {
         b'0'..=b'5' => byte - b'0' + 26,
         _ => 0,
     }
+}
+
+fn encoded_len(input_len: usize) -> usize {
+    let full = (input_len / 5) * 8;
+    let rem = match input_len % 5 {
+        0 => 0,
+        1 => 2,
+        2 => 4,
+        3 => 5,
+        _ => 7,
+    };
+    full + rem
 }
 
 pub fn b32_5to8(input: u8) -> u8 {
@@ -22,92 +43,12 @@ pub fn encode(data: &[u8]) -> String {
 }
 
 pub fn encode_with_limit(data: &[u8], max_output: usize) -> (String, usize) {
-    let size = data.len();
-    let mut out = Vec::new();
-    let mut iin = 0usize;
-
-    loop {
-        if out.len() >= max_output || iin >= size {
-            break;
-        }
-        out.push(ALPHABET[((data[iin] & 0xf8) >> 3) as usize]);
-
-        if out.len() >= max_output || iin >= size {
-            out.pop();
-            break;
-        }
-        out.push(
-            ALPHABET[(((data[iin] & 0x07) << 2)
-                | if iin + 1 < size {
-                    (data[iin + 1] & 0xc0) >> 6
-                } else {
-                    0
-                }) as usize],
-        );
-        iin += 1;
-
-        if out.len() >= max_output || iin >= size {
-            break;
-        }
-        out.push(ALPHABET[((data[iin] & 0x3e) >> 1) as usize]);
-
-        if out.len() >= max_output || iin >= size {
-            out.pop();
-            break;
-        }
-        out.push(
-            ALPHABET[(((data[iin] & 0x01) << 4)
-                | if iin + 1 < size {
-                    (data[iin + 1] & 0xf0) >> 4
-                } else {
-                    0
-                }) as usize],
-        );
-        iin += 1;
-
-        if out.len() >= max_output || iin >= size {
-            break;
-        }
-        out.push(
-            ALPHABET[(((data[iin] & 0x0f) << 1)
-                | if iin + 1 < size {
-                    (data[iin + 1] & 0x80) >> 7
-                } else {
-                    0
-                }) as usize],
-        );
-        iin += 1;
-
-        if out.len() >= max_output || iin >= size {
-            break;
-        }
-        out.push(ALPHABET[((data[iin] & 0x7c) >> 2) as usize]);
-
-        if out.len() >= max_output || iin >= size {
-            out.pop();
-            break;
-        }
-        out.push(
-            ALPHABET[(((data[iin] & 0x03) << 3)
-                | if iin + 1 < size {
-                    (data[iin + 1] & 0xe0) >> 5
-                } else {
-                    0
-                }) as usize],
-        );
-        iin += 1;
-
-        if out.len() >= max_output || iin >= size {
-            break;
-        }
-        out.push(ALPHABET[(data[iin] & 0x1f) as usize]);
-        iin += 1;
+    let mut consumed = 0usize;
+    while consumed < data.len() && encoded_len(consumed + 1) <= max_output {
+        consumed += 1;
     }
 
-    (
-        String::from_utf8(out).expect("base32 alphabet must be utf-8"),
-        iin,
-    )
+    (encoding().encode(&data[..consumed]), consumed)
 }
 
 pub fn decode(input: &str) -> Vec<u8> {
@@ -115,51 +56,8 @@ pub fn decode(input: &str) -> Vec<u8> {
 }
 
 pub fn decode_bytes(input: &[u8]) -> Vec<u8> {
-    let slen = input.len();
-    let mut out = Vec::new();
-    let mut iin = 0usize;
-
-    loop {
-        if iin + 1 >= slen || input[iin] == 0 || input[iin + 1] == 0 {
-            break;
-        }
-        out.push(((rev32(input[iin]) & 0x1f) << 3) | ((rev32(input[iin + 1]) & 0x1c) >> 2));
-        iin += 1;
-
-        if iin + 2 >= slen || input[iin] == 0 || input[iin + 1] == 0 || input[iin + 2] == 0 {
-            break;
-        }
-        out.push(
-            ((rev32(input[iin]) & 0x03) << 6)
-                | ((rev32(input[iin + 1]) & 0x1f) << 1)
-                | ((rev32(input[iin + 2]) & 0x10) >> 4),
-        );
-        iin += 2;
-
-        if iin + 1 >= slen || input[iin] == 0 || input[iin + 1] == 0 {
-            break;
-        }
-        out.push(((rev32(input[iin]) & 0x0f) << 4) | ((rev32(input[iin + 1]) & 0x1e) >> 1));
-        iin += 1;
-
-        if iin + 2 >= slen || input[iin] == 0 || input[iin + 1] == 0 || input[iin + 2] == 0 {
-            break;
-        }
-        out.push(
-            ((rev32(input[iin]) & 0x01) << 7)
-                | ((rev32(input[iin + 1]) & 0x1f) << 2)
-                | ((rev32(input[iin + 2]) & 0x18) >> 3),
-        );
-        iin += 2;
-
-        if iin + 1 >= slen || input[iin] == 0 || input[iin + 1] == 0 {
-            break;
-        }
-        out.push(((rev32(input[iin]) & 0x07) << 5) | (rev32(input[iin + 1]) & 0x1f));
-        iin += 2;
-    }
-
-    out
+    let normalized: Vec<u8> = input.iter().map(|b| b.to_ascii_lowercase()).collect();
+    encoding().decode(&normalized).unwrap_or_default()
 }
 
 #[cfg(test)]

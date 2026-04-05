@@ -1,11 +1,21 @@
-const ALPHABET: &[u8; 64] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789+";
+use data_encoding::{Encoding, Specification};
 
-fn rev64(byte: u8) -> u8 {
-    ALPHABET
-        .iter()
-        .position(|&b| b == byte)
-        .map(|i| i as u8)
-        .unwrap_or(0)
+fn encoding() -> Encoding {
+    let mut spec = Specification::new();
+    spec.symbols
+        .push_str("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789+");
+    spec.padding = None;
+    spec.encoding().expect("valid base64 specification")
+}
+
+fn encoded_len(input_len: usize) -> usize {
+    let full = (input_len / 3) * 4;
+    let rem = match input_len % 3 {
+        0 => 0,
+        1 => 2,
+        _ => 3,
+    };
+    full + rem
 }
 
 pub fn encode(data: &[u8]) -> String {
@@ -13,54 +23,12 @@ pub fn encode(data: &[u8]) -> String {
 }
 
 pub fn encode_with_limit(data: &[u8], max_output: usize) -> (String, usize) {
-    let size = data.len();
-    let mut out = Vec::new();
-    let mut iin = 0usize;
-
-    loop {
-        if out.len() >= max_output || iin >= size {
-            break;
-        }
-        out.push(ALPHABET[((data[iin] & 0xfc) >> 2) as usize]);
-
-        if out.len() >= max_output || iin >= size {
-            out.pop();
-            break;
-        }
-        out.push(
-            ALPHABET[(((data[iin] & 0x03) << 4)
-                | if iin + 1 < size {
-                    (data[iin + 1] & 0xf0) >> 4
-                } else {
-                    0
-                }) as usize],
-        );
-        iin += 1;
-
-        if out.len() >= max_output || iin >= size {
-            break;
-        }
-        out.push(
-            ALPHABET[(((data[iin] & 0x0f) << 2)
-                | if iin + 1 < size {
-                    (data[iin + 1] & 0xc0) >> 6
-                } else {
-                    0
-                }) as usize],
-        );
-        iin += 1;
-
-        if out.len() >= max_output || iin >= size {
-            break;
-        }
-        out.push(ALPHABET[(data[iin] & 0x3f) as usize]);
-        iin += 1;
+    let mut consumed = 0usize;
+    while consumed < data.len() && encoded_len(consumed + 1) <= max_output {
+        consumed += 1;
     }
 
-    (
-        String::from_utf8(out).expect("base64 alphabet must be utf-8"),
-        iin,
-    )
+    (encoding().encode(&data[..consumed]), consumed)
 }
 
 pub fn decode(input: &str) -> Vec<u8> {
@@ -68,31 +36,7 @@ pub fn decode(input: &str) -> Vec<u8> {
 }
 
 pub fn decode_bytes(input: &[u8]) -> Vec<u8> {
-    let slen = input.len();
-    let mut out = Vec::new();
-    let mut iin = 0usize;
-
-    loop {
-        if iin + 1 >= slen || input[iin] == 0 || input[iin + 1] == 0 {
-            break;
-        }
-        out.push(((rev64(input[iin]) & 0x3f) << 2) | ((rev64(input[iin + 1]) & 0x30) >> 4));
-        iin += 1;
-
-        if iin + 1 >= slen || input[iin] == 0 || input[iin + 1] == 0 {
-            break;
-        }
-        out.push(((rev64(input[iin]) & 0x0f) << 4) | ((rev64(input[iin + 1]) & 0x3c) >> 2));
-        iin += 1;
-
-        if iin + 1 >= slen || input[iin] == 0 || input[iin + 1] == 0 {
-            break;
-        }
-        out.push(((rev64(input[iin]) & 0x03) << 6) | (rev64(input[iin + 1]) & 0x3f));
-        iin += 2;
-    }
-
-    out
+    encoding().decode(input).unwrap_or_default()
 }
 
 #[cfg(test)]
