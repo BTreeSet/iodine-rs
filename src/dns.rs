@@ -1,7 +1,14 @@
 use std::io::Cursor;
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
+
+pub const CLASS_IN: u16 = 1;
+pub const TYPE_A: u16 = 1;
+pub const TYPE_CNAME: u16 = 5;
+pub const TYPE_NULL: u16 = 10;
+pub const TYPE_TXT: u16 = 16;
+pub const TYPE_SRV: u16 = 33;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DnsHeader {
@@ -38,6 +45,15 @@ impl DnsHeader {
         }
 
         Ok(header)
+    }
+
+    pub fn write_to(self, buf: &mut BytesMut) {
+        buf.put_u16(self.id);
+        buf.put_u16(self.flags);
+        buf.put_u16(self.qdcount);
+        buf.put_u16(self.ancount);
+        buf.put_u16(self.nscount);
+        buf.put_u16(self.arcount);
     }
 
     pub fn is_response(self) -> bool {
@@ -80,6 +96,14 @@ impl<'a> DnsQuestion<'a> {
             qclass,
         })
     }
+
+    pub fn write_to(self, buf: &mut BytesMut) -> Result<(), DnsError> {
+        validate_name_wire_for_write(self.qname_wire)?;
+        buf.put_slice(self.qname_wire);
+        buf.put_u16(self.qtype);
+        buf.put_u16(self.qclass);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +113,92 @@ pub struct DnsResourceRecord<'a> {
     pub class: u16,
     pub ttl: u32,
     pub rdata: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsRecordData<'a> {
+    Txt(&'a [u8]),
+    Null(&'a [u8]),
+    Srv {
+        priority: u16,
+        weight: u16,
+        port: u16,
+        target_wire: &'a [u8],
+    },
+    Cname(&'a [u8]),
+    A([u8; 4]),
+    Raw {
+        rr_type: u16,
+        data: &'a [u8],
+    },
+}
+
+impl<'a> DnsRecordData<'a> {
+    fn rr_type(self) -> u16 {
+        match self {
+            Self::Txt(_) => TYPE_TXT,
+            Self::Null(_) => TYPE_NULL,
+            Self::Srv { .. } => TYPE_SRV,
+            Self::Cname(_) => TYPE_CNAME,
+            Self::A(_) => TYPE_A,
+            Self::Raw { rr_type, .. } => rr_type,
+        }
+    }
+
+    fn encoded_len(self) -> Result<usize, DnsError> {
+        match self {
+            Self::Txt(text) => {
+                if text.len() > u8::MAX as usize {
+                    return Err(DnsError::RdataTooLong(text.len()));
+                }
+                Ok(1 + text.len())
+            }
+            Self::Null(data) => Ok(data.len()),
+            Self::Srv { target_wire, .. } => {
+                validate_name_wire_for_write(target_wire)?;
+                Ok(6 + target_wire.len())
+            }
+            Self::Cname(name_wire) => {
+                validate_name_wire_for_write(name_wire)?;
+                Ok(name_wire.len())
+            }
+            Self::A(_) => Ok(4),
+            Self::Raw { data, .. } => Ok(data.len()),
+        }
+    }
+
+    fn write_rdata(self, buf: &mut BytesMut) -> Result<(), DnsError> {
+        match self {
+            Self::Txt(text) => {
+                if text.len() > u8::MAX as usize {
+                    return Err(DnsError::RdataTooLong(text.len()));
+                }
+                buf.put_u8(text.len() as u8);
+                buf.put_slice(text);
+            }
+            Self::Null(data) => buf.put_slice(data),
+            Self::Srv {
+                priority,
+                weight,
+                port,
+                target_wire,
+            } => {
+                validate_name_wire_for_write(target_wire)?;
+                buf.put_u16(priority);
+                buf.put_u16(weight);
+                buf.put_u16(port);
+                buf.put_slice(target_wire);
+            }
+            Self::Cname(name_wire) => {
+                validate_name_wire_for_write(name_wire)?;
+                buf.put_slice(name_wire);
+            }
+            Self::A(addr) => buf.put_slice(&addr),
+            Self::Raw { data, .. } => buf.put_slice(data),
+        }
+
+        Ok(())
+    }
 }
 
 impl<'a> DnsResourceRecord<'a> {
@@ -122,6 +232,96 @@ impl<'a> DnsResourceRecord<'a> {
             rdata: &raw[rdata_start..rdata_end],
         })
     }
+
+    pub fn from_data(name_wire: &'a [u8], class: u16, ttl: u32, data: DnsRecordData<'a>) -> Self {
+        Self {
+            name_wire,
+            rr_type: data.rr_type(),
+            class,
+            ttl,
+            rdata: data_bytes(data),
+        }
+    }
+
+    pub fn data(self) -> Result<DnsRecordData<'a>, DnsError> {
+        match self.rr_type {
+            TYPE_TXT => {
+                if self.rdata.is_empty() {
+                    return Err(DnsError::BufferTooShort);
+                }
+                let len = self.rdata[0] as usize;
+                if self.rdata.len().saturating_sub(1) < len {
+                    return Err(DnsError::BufferTooShort);
+                }
+                Ok(DnsRecordData::Txt(&self.rdata[1..1 + len]))
+            }
+            TYPE_NULL => Ok(DnsRecordData::Null(self.rdata)),
+            TYPE_SRV => {
+                if self.rdata.len() < 7 {
+                    return Err(DnsError::BufferTooShort);
+                }
+                let priority = u16::from_be_bytes([self.rdata[0], self.rdata[1]]);
+                let weight = u16::from_be_bytes([self.rdata[2], self.rdata[3]]);
+                let port = u16::from_be_bytes([self.rdata[4], self.rdata[5]]);
+                skip_name(self.rdata, 6)?;
+                Ok(DnsRecordData::Srv {
+                    priority,
+                    weight,
+                    port,
+                    target_wire: &self.rdata[6..],
+                })
+            }
+            TYPE_CNAME => {
+                skip_name(self.rdata, 0)?;
+                Ok(DnsRecordData::Cname(self.rdata))
+            }
+            TYPE_A => {
+                if self.rdata.len() != 4 {
+                    return Err(DnsError::RdataLengthMismatch {
+                        rr_type: TYPE_A,
+                        expected: 4,
+                        actual: self.rdata.len(),
+                    });
+                }
+                Ok(DnsRecordData::A([
+                    self.rdata[0],
+                    self.rdata[1],
+                    self.rdata[2],
+                    self.rdata[3],
+                ]))
+            }
+            other => Ok(DnsRecordData::Raw {
+                rr_type: other,
+                data: self.rdata,
+            }),
+        }
+    }
+
+    pub fn write_to(self, data: DnsRecordData<'a>, buf: &mut BytesMut) -> Result<(), DnsError> {
+        validate_name_wire_for_write(self.name_wire)?;
+        let rdlen = data.encoded_len()?;
+        if rdlen > u16::MAX as usize {
+            return Err(DnsError::RdataTooLong(rdlen));
+        }
+
+        buf.put_slice(self.name_wire);
+        buf.put_u16(self.rr_type);
+        buf.put_u16(self.class);
+        buf.put_u32(self.ttl);
+        buf.put_u16(rdlen as u16);
+        data.write_rdata(buf)
+    }
+}
+
+fn data_bytes<'a>(data: DnsRecordData<'a>) -> &'a [u8] {
+    match data {
+        DnsRecordData::Txt(s)
+        | DnsRecordData::Null(s)
+        | DnsRecordData::Cname(s)
+        | DnsRecordData::Raw { data: s, .. } => s,
+        DnsRecordData::Srv { target_wire, .. } => target_wire,
+        DnsRecordData::A(_) => &[],
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +347,60 @@ pub enum DnsError {
     PointerLoop,
     #[error("unterminated DNS name")]
     UnterminatedName,
+    #[error("record data too long: {0}")]
+    RdataTooLong(usize),
+    #[error("record data length mismatch for type {rr_type}: expected {expected}, got {actual}")]
+    RdataLengthMismatch {
+        rr_type: u16,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("packet section count mismatch")]
+    CountMismatch,
+}
+
+impl<'a> DnsPacket<'a> {
+    pub fn write_to(
+        &self,
+        buf: &mut BytesMut,
+        records: &DnsSectionData<'a>,
+    ) -> Result<(), DnsError> {
+        if self.questions.len() != self.header.qdcount as usize
+            || self.answers.len() != self.header.ancount as usize
+            || self.authorities.len() != self.header.nscount as usize
+            || self.additionals.len() != self.header.arcount as usize
+            || self.answers.len() != records.answers.len()
+            || self.authorities.len() != records.authorities.len()
+            || self.additionals.len() != records.additionals.len()
+        {
+            return Err(DnsError::CountMismatch);
+        }
+
+        self.header.write_to(buf);
+
+        for question in &self.questions {
+            question.write_to(buf)?;
+        }
+
+        for (record, data) in self.answers.iter().zip(&records.answers) {
+            record.write_to(*data, buf)?;
+        }
+        for (record, data) in self.authorities.iter().zip(&records.authorities) {
+            record.write_to(*data, buf)?;
+        }
+        for (record, data) in self.additionals.iter().zip(&records.additionals) {
+            record.write_to(*data, buf)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsSectionData<'a> {
+    pub answers: Vec<DnsRecordData<'a>>,
+    pub authorities: Vec<DnsRecordData<'a>>,
+    pub additionals: Vec<DnsRecordData<'a>>,
 }
 
 pub fn parse_packet(packet: &[u8]) -> Result<DnsPacket<'_>, DnsError> {
@@ -180,6 +434,32 @@ pub fn parse_packet(packet: &[u8]) -> Result<DnsPacket<'_>, DnsError> {
         authorities,
         additionals,
     })
+}
+
+fn validate_name_wire_for_write(name_wire: &[u8]) -> Result<(), DnsError> {
+    if name_wire.is_empty() {
+        return Err(DnsError::BufferTooShort);
+    }
+
+    let mut idx = 0usize;
+    while idx < name_wire.len() {
+        let len = name_wire[idx];
+        if (len & 0xC0) == 0xC0 {
+            if idx + 1 >= name_wire.len() {
+                return Err(DnsError::BufferTooShort);
+            }
+            return Ok(());
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        if len > 63 {
+            return Err(DnsError::LabelTooLong(len));
+        }
+        idx += 1 + len as usize;
+    }
+
+    Err(DnsError::UnterminatedName)
 }
 
 fn skip_name(packet: &[u8], start: usize) -> Result<usize, DnsError> {
@@ -234,67 +514,152 @@ fn skip_name(packet: &[u8], start: usize) -> Result<usize, DnsError> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use bytes::BytesMut;
 
-    use super::{parse_packet, DnsHeader, DnsQuestion};
+    use super::{
+        parse_packet, DnsHeader, DnsPacket, DnsQuestion, DnsRecordData, DnsResourceRecord,
+        DnsSectionData, CLASS_IN, TYPE_NULL,
+    };
+
+    const QUERY_PACKET: [u8; 82] = [
+        0x05, 0x39, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x2D, 0x41, 0x6A,
+        0x62, 0x63, 0x75, 0x79, 0x74, 0x63, 0x70, 0x65, 0x62, 0x30, 0x67, 0x71, 0x30, 0x6C, 0x74,
+        0x65, 0x62, 0x75, 0x78, 0x67, 0x69, 0x64, 0x75, 0x6E, 0x62, 0x73, 0x73, 0x61, 0x33, 0x64,
+        0x66, 0x6F, 0x6E, 0x30, 0x63, 0x61, 0x7A, 0x64, 0x62, 0x6F, 0x72, 0x71, 0x71, 0x04, 0x6B,
+        0x72, 0x79, 0x6F, 0x02, 0x73, 0x65, 0x00, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x00, 0x29, 0x10,
+        0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+    ];
+
+    const ANSWER_PACKET: [u8; 98] = [
+        0x05, 0x39, 0x84, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x05, 0x73, 0x69,
+        0x6C, 0x6C, 0x79, 0x04, 0x68, 0x6F, 0x73, 0x74, 0x02, 0x6F, 0x66, 0x06, 0x69, 0x6F, 0x64,
+        0x69, 0x6E, 0x65, 0x04, 0x63, 0x6F, 0x64, 0x65, 0x04, 0x6B, 0x72, 0x79, 0x6F, 0x02, 0x73,
+        0x65, 0x00, 0x00, 0x0A, 0x00, 0x01, 0xC0, 0x0C, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x23, 0x74, 0x68, 0x69, 0x73, 0x20, 0x69, 0x73, 0x20, 0x74, 0x68, 0x65, 0x20,
+        0x6D, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x20, 0x74, 0x6F, 0x20, 0x62, 0x65, 0x20, 0x64,
+        0x65, 0x6C, 0x69, 0x76, 0x65, 0x72, 0x65, 0x64,
+    ];
 
     #[test]
-    fn parse_header_from_raw_dns_query() {
-        let raw: [u8; 12] = [
-            0x1a, 0x2b, // id
-            0x01, 0x00, // flags
-            0x00, 0x01, // qdcount
-            0x00, 0x00, // ancount
-            0x00, 0x00, // nscount
-            0x00, 0x00, // arcount
-        ];
-
-        let mut cur = Cursor::new(raw.as_slice());
-        let header = DnsHeader::parse(&mut cur).expect("header should parse");
-        assert_eq!(header.id, 0x1a2b);
-        assert_eq!(header.qdcount, 1);
-        assert!(!header.is_response());
+    fn parse_query_packet_from_upstream_vector() {
+        let parsed = parse_packet(&QUERY_PACKET).expect("query parse");
+        assert_eq!(parsed.header.id, 0x0539);
+        assert_eq!(parsed.header.qdcount, 1);
+        assert_eq!(parsed.header.arcount, 1);
+        assert_eq!(parsed.questions[0].qtype, TYPE_NULL);
+        assert_eq!(parsed.questions[0].qclass, CLASS_IN);
+        assert_eq!(parsed.additionals[0].rr_type, 41);
+        assert_eq!(parsed.additionals[0].class, 4096);
+        assert_eq!(parsed.additionals[0].ttl, 0x0000_8000);
+        assert!(parsed.additionals[0].rdata.is_empty());
     }
 
     #[test]
-    fn parse_question_from_raw_dns_query_without_allocating_vec() {
-        let raw: [u8; 33] = [
-            0x1a, 0x2b, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'w',
-            b'w', b'w', 0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
-            0x00, 0x00, 0x01, 0x00, 0x01,
-        ];
-
-        let mut cur = Cursor::new(raw.as_slice());
-        let _ = DnsHeader::parse(&mut cur).expect("header should parse");
-        let question = DnsQuestion::parse(&mut cur).expect("question should parse");
-
-        assert_eq!(question.qtype, 1);
-        assert_eq!(question.qclass, 1);
-        assert_eq!(question.qname_wire[0], 0x03);
-    }
-
-    #[test]
-    fn parse_packet_with_a_answer_and_pointer_name() {
-        let packet: [u8; 49] = [
-            0x1a, 0x2b, // id
-            0x81, 0x80, // flags response noerror
-            0x00, 0x01, // qdcount
-            0x00, 0x01, // ancount
-            0x00, 0x00, // nscount
-            0x00, 0x00, // arcount
-            0x03, b'w', b'w', b'w', 0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c',
-            b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01, 0xC0, 0x0C, // pointer to qname
-            0x00, 0x01, // A
-            0x00, 0x01, // IN
-            0x00, 0x00, 0x00, 0x3C, // TTL
-            0x00, 0x04, // RDLEN
-            0x5D, 0xB8, 0xD8, 0x22, // 93.184.216.34
-        ];
-
-        let parsed = parse_packet(&packet).expect("packet should parse");
-        assert_eq!(parsed.questions.len(), 1);
+    fn parse_answer_packet_from_upstream_vector() {
+        let parsed = parse_packet(&ANSWER_PACKET).expect("answer parse");
+        assert_eq!(parsed.header.id, 0x0539);
+        assert!(parsed.header.is_response());
         assert_eq!(parsed.answers.len(), 1);
-        assert_eq!(parsed.answers[0].rr_type, 1);
-        assert_eq!(parsed.answers[0].rdata, &[0x5D, 0xB8, 0xD8, 0x22]);
+        assert_eq!(parsed.answers[0].rr_type, TYPE_NULL);
+        assert_eq!(
+            parsed.answers[0].rdata,
+            b"this is the message to be delivered"
+        );
+    }
+
+    #[test]
+    fn serialize_query_packet_matches_upstream_bytes() {
+        let parsed = parse_packet(&QUERY_PACKET).expect("parse source query");
+        let question_name = parsed.questions[0].qname_wire;
+        let root_name = parsed.additionals[0].name_wire;
+
+        let packet = DnsPacket {
+            header: DnsHeader {
+                id: 0x0539,
+                flags: 0x0100,
+                qdcount: 1,
+                ancount: 0,
+                nscount: 0,
+                arcount: 1,
+            },
+            questions: vec![DnsQuestion {
+                qname_wire: question_name,
+                qtype: TYPE_NULL,
+                qclass: CLASS_IN,
+            }],
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            additionals: vec![DnsResourceRecord {
+                name_wire: root_name,
+                rr_type: 41,
+                class: 4096,
+                ttl: 0x0000_8000,
+                rdata: &[],
+            }],
+        };
+
+        let mut out = BytesMut::with_capacity(QUERY_PACKET.len());
+        packet
+            .write_to(
+                &mut out,
+                &DnsSectionData {
+                    answers: Vec::new(),
+                    authorities: Vec::new(),
+                    additionals: vec![DnsRecordData::Raw {
+                        rr_type: 41,
+                        data: &[],
+                    }],
+                },
+            )
+            .expect("serialize query");
+
+        assert_eq!(out.as_ref(), QUERY_PACKET);
+    }
+
+    #[test]
+    fn serialize_answer_packet_matches_upstream_bytes() {
+        let parsed = parse_packet(&ANSWER_PACKET).expect("parse source answer");
+        let question_name = parsed.questions[0].qname_wire;
+        let pointer_name = parsed.answers[0].name_wire;
+        let msg_data = b"this is the message to be delivered";
+
+        let packet = DnsPacket {
+            header: DnsHeader {
+                id: 0x0539,
+                flags: 0x8400,
+                qdcount: 1,
+                ancount: 1,
+                nscount: 0,
+                arcount: 0,
+            },
+            questions: vec![DnsQuestion {
+                qname_wire: question_name,
+                qtype: TYPE_NULL,
+                qclass: CLASS_IN,
+            }],
+            answers: vec![DnsResourceRecord {
+                name_wire: pointer_name,
+                rr_type: TYPE_NULL,
+                class: CLASS_IN,
+                ttl: 0,
+                rdata: msg_data,
+            }],
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+        };
+
+        let mut out = BytesMut::with_capacity(ANSWER_PACKET.len());
+        packet
+            .write_to(
+                &mut out,
+                &DnsSectionData {
+                    answers: vec![DnsRecordData::Null(msg_data)],
+                    authorities: Vec::new(),
+                    additionals: Vec::new(),
+                },
+            )
+            .expect("serialize answer");
+
+        assert_eq!(out.as_ref(), ANSWER_PACKET);
     }
 }
