@@ -17,7 +17,10 @@ impl FwQuery {
     pub fn from_dns_question(addr: SocketAddr, id: u16, question: DnsQuestion<'_>) -> Self {
         Self {
             addr,
-            addrlen: std::mem::size_of_val(&addr),
+            addrlen: match addr {
+                SocketAddr::V4(_) => 16,
+                SocketAddr::V6(_) => 28,
+            },
             id,
             qtype: question.qtype,
             qname_wire: question.qname_wire.to_vec(),

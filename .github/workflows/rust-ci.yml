@@ -8,6 +8,8 @@ on:
 
 jobs:
   ci:
+    permissions:
+      contents: read
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:

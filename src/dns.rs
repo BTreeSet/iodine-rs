@@ -269,12 +269,12 @@ pub enum DnsError {
     UnterminatedName,
 }
 
-pub fn packet_id(packet: &[u8]) -> u16 {
+pub fn try_packet_id(packet: &[u8]) -> Option<u16> {
     if packet.len() < 12 {
-        return 0;
+        return None;
     }
 
-    u16::from_be_bytes([packet[0], packet[1]])
+    Some(u16::from_be_bytes([packet[0], packet[1]]))
 }
 
 pub fn parse_packet(packet: &[u8]) -> Result<DnsPacket<'_>, DnsError> {
@@ -392,8 +392,8 @@ mod tests {
     use bytes::BytesMut;
 
     use super::{
-        packet_id, parse_packet, DnsHeader, DnsPacket, DnsQuestion, DnsRdata, DnsResourceRecord,
-        DNS_CLASS_IN, DNS_TYPE_NULL, DNS_TYPE_OPT,
+        parse_packet, try_packet_id, DnsHeader, DnsPacket, DnsQuestion, DnsRdata,
+        DnsResourceRecord, DNS_CLASS_IN, DNS_TYPE_NULL, DNS_TYPE_OPT,
     };
 
     const QUERY_PACKET: &[u8] =
@@ -559,8 +559,17 @@ mod tests {
 
     #[test]
     fn get_id_matches_upstream_vectors() {
-        assert_eq!(packet_id(&[5, 5, 5, 5, 5]), 0);
-        assert_eq!(packet_id(ANSWER_PACKET), 1337);
-        assert_eq!(packet_id(ANSWER_PACKET_HIGH_TRANS_ID), 0x8539);
+        assert_eq!(try_packet_id(&[5, 5, 5, 5, 5]), None);
+        assert_eq!(try_packet_id(ANSWER_PACKET), Some(1337));
+        assert_eq!(try_packet_id(ANSWER_PACKET_HIGH_TRANS_ID), Some(0x8539));
+    }
+
+    #[test]
+    fn packet_id_distinguishes_short_packet_from_valid_zero() {
+        let valid_zero = [
+            0x00, 0x00, 0x84, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(try_packet_id(&valid_zero), Some(0));
+        assert_eq!(try_packet_id(&valid_zero[..11]), None);
     }
 }
