@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
 
+use bytes::Bytes;
+
 use crate::dns::DnsQuestion;
 
 pub const FW_QUERY_CACHE_SIZE: usize = 16;
@@ -12,7 +14,7 @@ pub struct FwQuery {
     pub addrlen: usize,
     pub id: u16,
     pub qtype: u16,
-    pub qname_wire: Vec<u8>,
+    pub qname_wire: Bytes,
 }
 
 impl FwQuery {
@@ -25,7 +27,7 @@ impl FwQuery {
             },
             id,
             qtype: question.qtype,
-            qname_wire: question.qname_wire.to_vec(),
+            qname_wire: Bytes::copy_from_slice(question.qname_wire),
         }
     }
 }
@@ -72,6 +74,8 @@ impl FwQueryCache {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    use bytes::Bytes;
+
     use crate::dns::DnsQuestion;
 
     use super::{FwQuery, FwQueryCache, FW_QUERY_CACHE_SIZE};
@@ -91,7 +95,7 @@ mod tests {
             addrlen: 33,
             id: 0x848A,
             qtype: 10,
-            qname_wire: Vec::new(),
+            qname_wire: Bytes::new(),
         });
 
         let found = cache.get(0x848A).expect("query should be cached");
@@ -108,7 +112,7 @@ mod tests {
             addrlen: 33,
             id: 0x848A,
             qtype: 10,
-            qname_wire: Vec::new(),
+            qname_wire: Bytes::new(),
         };
 
         cache.put(q.clone());
@@ -141,6 +145,6 @@ mod tests {
         let fw = FwQuery::from_dns_question(dummy_addr(), 1337, q);
         assert_eq!(fw.id, 1337);
         assert_eq!(fw.qtype, 10);
-        assert_eq!(fw.qname_wire, b"\x04test\x00");
+        assert_eq!(fw.qname_wire.as_ref(), b"\x04test\x00");
     }
 }
