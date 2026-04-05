@@ -54,12 +54,24 @@ pub fn decode(input: &str) -> Result<Vec<u8>, data_encoding::DecodeError> {
 }
 
 pub fn decode_bytes(input: &[u8]) -> Result<Vec<u8>, data_encoding::DecodeError> {
-    if input.iter().any(u8::is_ascii_uppercase) {
-        let mut normalized = input.to_vec();
-        normalized.make_ascii_lowercase();
-        IODINE_BASE32.decode(&normalized)
-    } else {
-        IODINE_BASE32.decode(input)
+    let mut normalized = None;
+    for (idx, &byte) in input.iter().enumerate() {
+        if byte.is_ascii_uppercase() {
+            let mut owned = input.to_vec();
+            owned[idx] = byte.to_ascii_lowercase();
+            for b in &mut owned[idx + 1..] {
+                if b.is_ascii_uppercase() {
+                    *b = b.to_ascii_lowercase();
+                }
+            }
+            normalized = Some(owned);
+            break;
+        }
+    }
+
+    match normalized {
+        Some(owned) => IODINE_BASE32.decode(&owned),
+        None => IODINE_BASE32.decode(input),
     }
 }
 

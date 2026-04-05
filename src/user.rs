@@ -5,8 +5,8 @@ use nix::errno::Errno;
 use nix::unistd::{chdir, chroot, setgid, setuid, User};
 
 fn errno_to_io(op: &str, err: Errno) -> io::Error {
-    let io_err = io::Error::from_raw_os_error(err as i32);
-    io::Error::new(io_err.kind(), format!("{op} failed: {err}"))
+    let kind = io::Error::from_raw_os_error(err as i32).kind();
+    io::Error::new(kind, format!("{op} failed: {err}"))
 }
 
 pub fn drop_privileges(username: &str, chroot_dir: Option<&Path>) -> Result<(), io::Error> {
