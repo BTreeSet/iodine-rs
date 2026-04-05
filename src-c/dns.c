@@ -47,7 +47,7 @@
 
 int dnsc_use_edns0 = 1;
 
-#define CHECKLEN(x) if (buflen < (x) + (unsigned)(p-buf))  return 0
+#define CHECKLEN(x) if (buflen < (x) + (size_t)(p-buf))  return 0
 
 int dns_encode(char *buf, size_t buflen, struct query *q, qr_t qr,
 	       const char *data, size_t datalen)
@@ -390,6 +390,71 @@ int dns_encode_a_response(char *buf, size_t buflen, struct query *q)
 	return len;
 }
 
+int dns_encode_nxdomain(char *buf, size_t buflen, struct query *q, const char *zone)
+{
+	char rnamebuf[256];
+	char nsbuf[256];
+	HEADER *header;
+	char *soa_start;
+	char *p;
+
+	if (buflen < sizeof(HEADER))
+		return 0;
+
+	memset(buf, 0, buflen);
+	header = (HEADER*)buf;
+
+	header->id = htons(q->id);
+	header->qr = 1;		// response
+	header->opcode = 0;
+	header->aa = 1;		// authoritative
+	header->tc = 0;
+	header->rd = 0;
+	header->ra = 0;
+	header->rcode = 3;	// NXDOMAIN
+
+	header->qdcount = htons(1);
+	header->ancount = htons(0);
+	header->nscount = htons(1); // We'll include SOA
+	header->arcount = htons(0);
+
+	p = buf + sizeof(HEADER);
+
+	// Question section
+	putname(&p, buflen - (p - buf), q->name);
+	CHECKLEN(4);
+	putshort(&p, q->type);
+	putshort(&p, C_IN);
+
+	// Authority section (SOA)
+	CHECKLEN(10);
+	putname(&p, buflen - (p - buf), zone); // zone name (owner of SOA)
+	putshort(&p, T_SOA);
+	putshort(&p, C_IN);
+	putlong(&p, 60); // TTL
+
+	soa_start = p;
+	p += 2; // skip rdlength (to be filled later)
+
+	// Primary NS and responsible mailbox
+	snprintf(nsbuf, sizeof(nsbuf), "ns.%s", zone);
+	putname(&p, buflen - (p - buf), nsbuf);
+	snprintf(rnamebuf, sizeof(rnamebuf), "hostmaster.%s", zone);
+	putname(&p, buflen - (p - buf), rnamebuf);
+
+	// SOA fields: serial, refresh, retry, expire, minimum
+	putlong(&p, 1);		// serial
+	putlong(&p, 3600);	// refresh
+	putlong(&p, 1800);	// retry
+	putlong(&p, 604800);	// expire
+	putlong(&p, 60);	// minimum
+
+	int soalen = p - soa_start - 2;
+	putshort(&soa_start, soalen); // fill in rdlength
+
+	return p - buf;
+}
+
 #undef CHECKLEN
 
 unsigned short dns_get_id(char *packet, size_t packetlen)
@@ -403,7 +468,7 @@ unsigned short dns_get_id(char *packet, size_t packetlen)
 	return ntohs(header->id);
 }
 
-#define CHECKLEN(x) if (packetlen < (x) + (unsigned)(data-packet))  return 0
+#define CHECKLEN(x) if (packetlen < (x) + (size_t)(data-packet))  return 0
 
 int dns_decode(char *buf, size_t buflen, struct query *q, qr_t qr, char *packet,
 	       size_t packetlen)
