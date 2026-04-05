@@ -54,7 +54,13 @@ pub fn decode(input: &str) -> Result<Vec<u8>, data_encoding::DecodeError> {
 }
 
 pub fn decode_bytes(input: &[u8]) -> Result<Vec<u8>, data_encoding::DecodeError> {
-    IODINE_BASE32.decode(input)
+    if input.iter().any(u8::is_ascii_uppercase) {
+        let mut normalized = input.to_vec();
+        normalized.make_ascii_lowercase();
+        IODINE_BASE32.decode(&normalized)
+    } else {
+        IODINE_BASE32.decode(input)
+    }
 }
 
 #[cfg(test)]
