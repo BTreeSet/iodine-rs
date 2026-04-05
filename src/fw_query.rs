@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use crate::dns::DnsQuestion;
 
 pub const FW_QUERY_CACHE_SIZE: usize = 16;
+pub const SOCKADDR_IN_LEN: usize = 16;
+pub const SOCKADDR_IN6_LEN: usize = 28;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FwQuery {
@@ -18,8 +20,8 @@ impl FwQuery {
         Self {
             addr,
             addrlen: match addr {
-                SocketAddr::V4(_) => 16,
-                SocketAddr::V6(_) => 28,
+                SocketAddr::V4(_) => SOCKADDR_IN_LEN,
+                SocketAddr::V6(_) => SOCKADDR_IN6_LEN,
             },
             id,
             qtype: question.qtype,

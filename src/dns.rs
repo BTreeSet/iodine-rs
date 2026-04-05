@@ -269,6 +269,8 @@ pub enum DnsError {
     UnterminatedName,
 }
 
+/// Extracts DNS transaction ID from the fixed 12-byte DNS header without
+/// parsing the full packet; returns `None` if fewer than 12 bytes are available.
 pub fn try_packet_id(packet: &[u8]) -> Option<u16> {
     if packet.len() < 12 {
         return None;
@@ -310,6 +312,8 @@ pub fn parse_packet(packet: &[u8]) -> Result<DnsPacket<'_>, DnsError> {
     })
 }
 
+/// TXT RDATA is encoded as one or more <length,chunk> strings with a
+/// maximum chunk size of 255 bytes; empty input is represented as one zero-length string.
 fn txt_encoded_len(data: &[u8]) -> usize {
     if data.is_empty() {
         return 1;
