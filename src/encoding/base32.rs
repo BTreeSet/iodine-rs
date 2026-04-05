@@ -1,13 +1,11 @@
-use data_encoding::{Encoding, Specification};
+use data_encoding::Encoding;
+use data_encoding_macro::new_encoding;
 
 const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz012345";
-
-fn encoding() -> Encoding {
-    let mut spec = Specification::new();
-    spec.symbols.push_str("abcdefghijklmnopqrstuvwxyz012345");
-    spec.padding = None;
-    spec.encoding().expect("valid base32 specification")
-}
+const IODINE_BASE32: Encoding = new_encoding! {
+    symbols: "abcdefghijklmnopqrstuvwxyz012345",
+    padding: None,
+};
 
 fn rev32(byte: u8) -> u8 {
     match byte {
@@ -48,7 +46,7 @@ pub fn encode_with_limit(data: &[u8], max_output: usize) -> (String, usize) {
         consumed += 1;
     }
 
-    (encoding().encode(&data[..consumed]), consumed)
+    (IODINE_BASE32.encode(&data[..consumed]), consumed)
 }
 
 pub fn decode(input: &str) -> Vec<u8> {
@@ -57,7 +55,7 @@ pub fn decode(input: &str) -> Vec<u8> {
 
 pub fn decode_bytes(input: &[u8]) -> Vec<u8> {
     let normalized: Vec<u8> = input.iter().map(|b| b.to_ascii_lowercase()).collect();
-    encoding().decode(&normalized).unwrap_or_default()
+    IODINE_BASE32.decode(&normalized).unwrap_or_default()
 }
 
 #[cfg(test)]

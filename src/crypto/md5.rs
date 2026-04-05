@@ -28,9 +28,7 @@ impl Md5 {
 }
 
 pub fn compute_md5(data: &[u8]) -> [u8; 16] {
-    let mut md5 = Md5::new();
-    md5.update(data);
-    md5.finalize()
+    Md5Hasher::digest(data).into()
 }
 
 #[cfg(test)]

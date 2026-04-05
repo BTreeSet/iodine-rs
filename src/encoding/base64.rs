@@ -1,12 +1,10 @@
-use data_encoding::{Encoding, Specification};
+use data_encoding::Encoding;
+use data_encoding_macro::new_encoding;
 
-fn encoding() -> Encoding {
-    let mut spec = Specification::new();
-    spec.symbols
-        .push_str("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789+");
-    spec.padding = None;
-    spec.encoding().expect("valid base64 specification")
-}
+const IODINE_BASE64: Encoding = new_encoding! {
+    symbols: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789+",
+    padding: None,
+};
 
 fn encoded_len(input_len: usize) -> usize {
     let full = (input_len / 3) * 4;
@@ -28,7 +26,7 @@ pub fn encode_with_limit(data: &[u8], max_output: usize) -> (String, usize) {
         consumed += 1;
     }
 
-    (encoding().encode(&data[..consumed]), consumed)
+    (IODINE_BASE64.encode(&data[..consumed]), consumed)
 }
 
 pub fn decode(input: &str) -> Vec<u8> {
@@ -36,7 +34,7 @@ pub fn decode(input: &str) -> Vec<u8> {
 }
 
 pub fn decode_bytes(input: &[u8]) -> Vec<u8> {
-    encoding().decode(input).unwrap_or_default()
+    IODINE_BASE64.decode(input).unwrap_or_default()
 }
 
 #[cfg(test)]
