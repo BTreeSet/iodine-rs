@@ -1,0 +1,34 @@
+services:
+  server:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile
+    container_name: server
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      internet:
+        ipv4_address: 172.20.0.10
+    entrypoint: ["sleep", "infinity"]
+
+  client:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile
+    container_name: client
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      - internet
+    entrypoint: ["sleep", "infinity"]
+
+networks:
+  internet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
