@@ -16,12 +16,13 @@ enum Mode {
     Iodined(iodine_rs::server::ServerArgs),
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
     match cli.mode {
         Mode::Iodine(args) => iodine_rs::client::run(args),
-        Mode::Iodined(args) => iodine_rs::server::run(args),
+        Mode::Iodined(args) => iodine_rs::server::run(args).await,
     }
 }
