@@ -5,6 +5,8 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
+const SESSION_NOT_FOUND: &str = "session not found for user id";
+
 #[derive(Debug, Clone)]
 pub struct User {
     pub id: u32,
@@ -58,7 +60,7 @@ impl ServerState {
             .active_sessions
             .write()
             .expect("active_sessions lock poisoned during queue_downstream_packet");
-        let session = sessions.get_mut(&user_id).ok_or("session not found")?;
+        let session = sessions.get_mut(&user_id).ok_or(SESSION_NOT_FOUND)?;
         session.downstream_queue.push_back(packet);
         session.last_active = Instant::now();
         Ok(())
