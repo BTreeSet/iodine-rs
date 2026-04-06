@@ -452,6 +452,96 @@ fn handle_control_request(
             .into_bytes();
             Some(ControlResponse { rr_type, payload })
         }
+        b'i' => {
+            let mut payload = Vec::with_capacity(5);
+            payload.push(b'I');
+            payload.extend_from_slice(&tun_ip.octets());
+            Some(ControlResponse { rr_type, payload })
+        }
+        b'z' => Some(ControlResponse {
+            rr_type,
+            payload: first_label.to_vec(),
+        }),
+        b's' => {
+            if first_label.len() < 3 {
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: b"BADLEN".to_vec(),
+                });
+            }
+            let codec = decode_base32_char(first_label[2]).unwrap_or(0);
+            let payload = match codec {
+                5 => b"Base32".to_vec(),
+                6 => b"Base64".to_vec(),
+                26 => b"Base64u".to_vec(),
+                7 => b"Base128".to_vec(),
+                _ => b"BADCODEC".to_vec(),
+            };
+            Some(ControlResponse { rr_type, payload })
+        }
+        b'o' => {
+            if first_label.len() < 3 {
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: b"BADLEN".to_vec(),
+                });
+            }
+            let payload = match first_label[2].to_ascii_lowercase() {
+                b't' => b"Base32".to_vec(),
+                b's' => b"Base64".to_vec(),
+                b'u' => b"Base64u".to_vec(),
+                b'v' => b"Base128".to_vec(),
+                b'r' => b"Raw".to_vec(),
+                b'l' => b"Lazy".to_vec(),
+                b'i' => b"Immediate".to_vec(),
+                _ => b"BADCODEC".to_vec(),
+            };
+            Some(ControlResponse { rr_type, payload })
+        }
+        b'r' => {
+            if first_label.len() < 4 {
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: b"BADLEN".to_vec(),
+                });
+            }
+            let c1 = decode_base32_char(first_label[1]).unwrap_or(0);
+            let c2 = decode_base32_char(first_label[2]).unwrap_or(0);
+            let c3 = decode_base32_char(first_label[3]).unwrap_or(0);
+            let req_frag_size = (((c1 & 1) as usize) << 10) | ((c2 as usize) << 5) | (c3 as usize);
+            if !(2..=2047).contains(&req_frag_size) {
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: b"BADFRAG".to_vec(),
+                });
+            }
+            let mut payload = vec![0u8; req_frag_size];
+            payload[0] = ((req_frag_size >> 8) & 0xff) as u8;
+            payload[1] = (req_frag_size & 0xff) as u8;
+            if req_frag_size > 2 {
+                payload[2] = 107;
+                let mut v: u8 = 0x42;
+                for b in payload.iter_mut().skip(3) {
+                    *b = v;
+                    v = v.wrapping_add(107);
+                }
+            }
+            Some(ControlResponse { rr_type, payload })
+        }
+        b'n' => {
+            let decoded = crate::encoding::base32::decode_bytes(&first_label[1..]).ok()?;
+            if decoded.len() < 3 {
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: b"BADLEN".to_vec(),
+                });
+            }
+            let frag = u16::from_be_bytes([decoded[1], decoded[2]]);
+            Some(ControlResponse {
+                rr_type,
+                payload: vec![(frag >> 8) as u8, (frag & 0xff) as u8],
+            })
+        }
         _ => None,
     }
 }
