@@ -11,6 +11,7 @@ use crate::server::pool::IpPool;
 use tracing::debug;
 
 const MAX_DOWNSTREAM_QUEUE: usize = 128;
+const DNS_CACHE_SIZE: usize = 1024;
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum ServerError {
@@ -53,7 +54,7 @@ impl ServerState {
             sessions_by_id: RwLock::new(HashMap::new()),
             session_id_by_ip: RwLock::new(HashMap::new()),
             ip_pool: Mutex::new(IpPool::new(network, netmask)),
-            dns_cache: Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap())),
+            dns_cache: Mutex::new(LruCache::new(NonZeroUsize::new(DNS_CACHE_SIZE).unwrap())),
         }
     }
 
@@ -111,18 +112,18 @@ impl ServerState {
             downstream_queue: VecDeque::new(),
             last_active: Instant::now(),
         };
-        let mut sessions = self
-            .sessions_by_id
-            .write()
-            .expect("sessions_by_id lock poisoned during create_session");
-        sessions.insert(user_id, session.clone());
-        drop(sessions);
-
         let mut by_ip = self
             .session_id_by_ip
             .write()
             .expect("session_id_by_ip lock poisoned during create_session");
         by_ip.insert(session.virtual_ip, user_id);
+        drop(by_ip);
+
+        let mut sessions = self
+            .sessions_by_id
+            .write()
+            .expect("sessions_by_id lock poisoned during create_session");
+        sessions.insert(user_id, session);
         Ok((user_id, virtual_ip))
     }
 

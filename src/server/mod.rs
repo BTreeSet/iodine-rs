@@ -13,6 +13,9 @@ use state::ServerState;
 const DNS_HEADER_LEN: usize = 12;
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV4_DST_OFFSET: usize = 16;
+const DEFAULT_TUN_NETWORK: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 0);
+const DEFAULT_TUN_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+const DEFAULT_TUN_SERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 #[derive(Debug, Clone, Args)]
 pub struct ServerArgs {
@@ -30,14 +33,10 @@ pub async fn run(args: ServerArgs) {
         .parse()
         .expect("bind_addr must be a valid socket address");
 
-    let state = ServerState::new(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0));
-    let mut tun_device = crate::tun::create_tun_device(
-        "iodine0",
-        Ipv4Addr::new(10, 0, 0, 1),
-        Ipv4Addr::new(255, 255, 255, 0),
-        1500,
-    )
-    .expect("failed to create tun device");
+    let state = ServerState::new(DEFAULT_TUN_NETWORK, DEFAULT_TUN_NETMASK);
+    let mut tun_device =
+        crate::tun::create_tun_device("iodine0", DEFAULT_TUN_SERVER_IP, DEFAULT_TUN_NETMASK, 1500)
+            .expect("failed to create tun device");
     let socket = UdpSocket::bind(bind_addr)
         .await
         .expect("failed to bind UDP socket");
@@ -76,11 +75,11 @@ pub async fn run(args: ServerArgs) {
 
                 let query_key = packet.to_vec();
                 let response = Bytes::copy_from_slice(packet);
-                state.put_cache(query_key, response.clone());
                 if let Err(err) = socket.send_to(&response, peer).await {
                     warn!(error = %err, "udp send_to response failed");
                     continue;
                 }
+                state.put_cache(query_key, response);
 
                 // Placeholder tunnel payload extraction starts immediately after DNS header.
                 if packet.len() > DNS_HEADER_LEN {
