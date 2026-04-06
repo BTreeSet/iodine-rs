@@ -5,7 +5,7 @@ use std::net::Ipv4Addr;
 pub struct IpPool {
     pub network: Ipv4Addr,
     pub netmask: Ipv4Addr,
-    pub available: VecDeque<Ipv4Addr>,
+    available: VecDeque<Ipv4Addr>,
     available_set: HashSet<Ipv4Addr>,
 }
 
@@ -50,7 +50,7 @@ impl IpPool {
         if self.available_set.contains(&ip) {
             return;
         }
-        self.available.push_front(ip);
+        self.available.push_back(ip);
         self.available_set.insert(ip);
     }
 }
@@ -81,9 +81,13 @@ mod tests {
         let mut pool = IpPool::new(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0));
         let leased = pool.acquire().expect("pool should have available address");
         pool.release(leased);
-        let reacquired = pool
-            .acquire()
-            .expect("released address should be available");
-        assert_eq!(reacquired, leased);
+        let mut reacquired = None;
+        while let Some(ip) = pool.acquire() {
+            if ip == leased {
+                reacquired = Some(ip);
+                break;
+            }
+        }
+        assert_eq!(reacquired, Some(leased));
     }
 }

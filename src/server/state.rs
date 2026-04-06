@@ -6,6 +6,7 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use crate::server::pool::IpPool;
+use tracing::debug;
 
 const SESSION_NOT_FOUND: &str = "session not found";
 const AUTH_FAILED: &str = "authentication failed";
@@ -117,6 +118,11 @@ impl ServerState {
         let session = sessions.get_mut(&session_id).ok_or(SESSION_NOT_FOUND)?;
         if session.downstream_queue.len() >= MAX_DOWNSTREAM_QUEUE {
             session.downstream_queue.pop_front();
+            debug!(
+                session_id,
+                max_queue = MAX_DOWNSTREAM_QUEUE,
+                "downstream queue full; dropped oldest packet"
+            );
         }
         session.downstream_queue.push_back(packet);
         session.last_active = Instant::now();
@@ -145,6 +151,38 @@ mod tests {
         assert_eq!(user.id, id);
         assert_eq!(user.username, username);
         assert_eq!(user.password_hash, password_hash);
+    }
+
+    #[test]
+    fn add_user_duplicate_username_overwrites_and_returns_new_id() {
+        let state = ServerState::new(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0));
+        let username = "alice".to_string();
+        let old_hash = [0x11; 16];
+        let new_hash = [0x22; 16];
+
+        let first_id = state.add_user(username.clone(), old_hash);
+        let second_id = state.add_user(username.clone(), new_hash);
+
+        assert_ne!(first_id, second_id);
+        let users = state.users.read().expect("users lock should be readable");
+        let user = users
+            .get(&username)
+            .expect("username should still be present");
+        assert_eq!(user.id, second_id);
+        assert_eq!(user.password_hash, new_hash);
+    }
+
+    #[test]
+    fn authenticate_user_fails_for_invalid_credentials_or_unknown_user() {
+        let state = ServerState::new(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0));
+        let username = "alice".to_string();
+        let password_hash = [0xCD; 16];
+        let wrong_hash = [0xEE; 16];
+        let id = state.add_user(username.clone(), password_hash);
+
+        assert_eq!(state.authenticate_user(&username, password_hash), Some(id));
+        assert_eq!(state.authenticate_user(&username, wrong_hash), None);
+        assert_eq!(state.authenticate_user("unknown", password_hash), None);
     }
 
     #[test]
