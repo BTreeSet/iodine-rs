@@ -14,6 +14,28 @@ use tracing::debug;
 const MAX_DOWNSTREAM_QUEUE: usize = 128;
 const DNS_CACHE_SIZE: usize = 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    Base32 = 0,
+    Base64 = 1,
+    Base64u = 2,
+    Base128 = 3,
+}
+
+impl TryFrom<u8> for Codec {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Base32),
+            1 => Ok(Self::Base64),
+            2 => Ok(Self::Base64u),
+            3 => Ok(Self::Base128),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum ServerError {
     #[error("session not found")]
@@ -22,6 +44,12 @@ pub enum ServerError {
     AuthFailed,
     #[error("no ip address available")]
     NoIpAvailable,
+    #[error("invalid packet: {0}")]
+    InvalidPacket(String),
+    #[error("encoding error: {0}")]
+    Encoding(String),
+    #[error("io error: {0}")]
+    Io(String),
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +63,7 @@ pub struct User {
 pub struct Session {
     pub user_id: u32,
     pub virtual_ip: Ipv4Addr,
+    pub upstream_codec: Codec,
     pub downstream_queue: VecDeque<Bytes>,
     pub last_active: Instant,
 }
@@ -107,6 +136,7 @@ impl ServerState {
         let session = Session {
             user_id,
             virtual_ip,
+            upstream_codec: Codec::Base32,
             downstream_queue: VecDeque::new(),
             last_active: Instant::now(),
         };
@@ -187,6 +217,32 @@ impl ServerState {
             session.last_active = Instant::now();
         }
         Ok(packet)
+    }
+
+    pub fn set_user_codec(&self, user_id: u32, codec: Codec) -> Result<(), ServerError> {
+        let mut sessions = self
+            .sessions_by_id
+            .write()
+            .expect("sessions_by_id lock poisoned during set_user_codec");
+        let session = sessions
+            .get_mut(&user_id)
+            .ok_or(ServerError::SessionNotFound)?;
+        session.upstream_codec = codec;
+        session.last_active = Instant::now();
+        Ok(())
+    }
+
+    pub fn user_codec(&self, user_id: u32) -> Result<Codec, ServerError> {
+        let sessions = self
+            .sessions_by_id
+            .read()
+            .expect("sessions_by_id lock poisoned during user_codec");
+        let session = sessions.get(&user_id).ok_or(ServerError::SessionNotFound)?;
+        Ok(session.upstream_codec)
+    }
+
+    pub fn user_codec_or_default(&self, user_id: u32, default: Codec) -> Codec {
+        self.user_codec(user_id).unwrap_or(default)
     }
 }
 

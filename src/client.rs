@@ -196,8 +196,5 @@ fn decode_base64_payload(encoded: &[u8]) -> Option<Vec<u8>> {
         return Some(Vec::new());
     }
     let decoded = crate::encoding::base64::decode_bytes(encoded);
-    if decoded.is_empty() {
-        return None;
-    }
-    Some(decoded)
+    decoded.ok()
 }
