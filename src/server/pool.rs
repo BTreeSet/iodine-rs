@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::net::Ipv4Addr;
 
 #[derive(Debug, Clone)]
@@ -6,6 +6,7 @@ pub struct IpPool {
     pub network: Ipv4Addr,
     pub netmask: Ipv4Addr,
     pub available: VecDeque<Ipv4Addr>,
+    available_set: HashSet<Ipv4Addr>,
 }
 
 impl IpPool {
@@ -16,9 +17,12 @@ impl IpPool {
         let base = network_u32 & mask_u32;
         let broadcast = base | !mask_u32;
 
+        let mut available_set = HashSet::new();
         if broadcast.saturating_sub(base) > 1 {
             for raw in (base + 1)..broadcast {
-                available.push_back(Ipv4Addr::from(raw));
+                let ip = Ipv4Addr::from(raw);
+                available.push_back(ip);
+                available_set.insert(ip);
             }
         }
 
@@ -26,11 +30,14 @@ impl IpPool {
             network: Ipv4Addr::from(base),
             netmask,
             available,
+            available_set,
         }
     }
 
     pub fn acquire(&mut self) -> Option<Ipv4Addr> {
-        self.available.pop_front()
+        let ip = self.available.pop_front()?;
+        self.available_set.remove(&ip);
+        Some(ip)
     }
 
     pub fn release(&mut self, ip: Ipv4Addr) {
@@ -40,10 +47,11 @@ impl IpPool {
         if ip_raw <= base || ip_raw >= broadcast {
             return;
         }
-        if self.available.contains(&ip) {
+        if self.available_set.contains(&ip) {
             return;
         }
         self.available.push_front(ip);
+        self.available_set.insert(ip);
     }
 }
 
