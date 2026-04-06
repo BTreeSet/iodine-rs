@@ -78,21 +78,25 @@ pub async fn run(args: ClientArgs) {
         .password
         .expect("tunnel password must be provided via --password or IODINE_PASSWORD");
 
-    let mut dns_id: u16 = 1;
     let mut tun_buf = [0u8; 2048];
     let mut udp_buf = [0u8; 2048];
-    let mut downstream = DownstreamState::default();
-    let mut session = ClientSession::default();
+    let mut state = ClientState {
+        topdomain,
+        nameserver,
+        dns_id: 1,
+        downstream: DownstreamState::default(),
+        session: ClientSession::default(),
+    };
     let mut ping_tick = tokio::time::interval(Duration::from_millis(300));
 
     if let Err(err) = perform_handshake(
         &socket,
-        nameserver,
-        &topdomain,
+        state.nameserver,
+        &state.topdomain,
         &password,
-        &mut dns_id,
+        &mut state.dns_id,
         &mut udp_buf,
-        &mut session,
+        &mut state.session,
     )
     .await
     {
@@ -102,182 +106,231 @@ pub async fn run(args: ClientArgs) {
     loop {
         tokio::select! {
             tun_read = tun_device.read(&mut tun_buf) => {
-                let len = match tun_read {
-                    Ok(v) => v,
+                match tun_read {
+                    Ok(len) => {
+                        handle_tun_read(&tun_buf[..len], &mut state, &socket).await;
+                    }
                     Err(err) => {
                         warn!(error = %err, "tun read failed");
-                        continue;
                     }
-                };
-                if !session.authenticated {
-                    continue;
-                }
-                if len == 0 {
-                    continue;
-                }
-                let ip_version = tun_buf[0] >> 4;
-                if ip_version != 4 {
-                    debug!(ip_version, len, "ignoring non-ipv4 tun packet");
-                    continue;
-                }
-                let packet = if session.mode == ClientMode::CCompat {
-                    with_tun_header(&tun_buf[..len])
-                } else {
-                    tun_buf[..len].to_vec()
-                };
-                let compressed = match compress_zlib(&packet) {
-                    Some(v) => v,
-                    None => {
-                        warn!("failed to compress upstream packet");
-                        continue;
-                    }
-                };
-                let mut offset = 0usize;
-                let seq = session.next_up_seq;
-                session.next_up_seq = (session.next_up_seq + 1) & 0x07;
-                let mut frag = 0u8;
-                while offset < compressed.len() {
-                    let end = (offset + 96).min(compressed.len());
-                    let chunk = &compressed[offset..end];
-                    let is_last = end == compressed.len();
-                    let header = build_upstream_header(
-                        session.userid_char,
-                        seq,
-                        frag,
-                        session.down_ack_seq,
-                        session.down_ack_frag,
-                        is_last,
-                        session.next_cmc,
-                    );
-                    session.next_cmc = (session.next_cmc + 1) % 36;
-                    let encoded_chunk = crate::encoding::base32::encode(chunk);
-                    let qname = format!("{header}{}.{topdomain}", crate::encoding::inline_dotify(&encoded_chunk));
-                    if send_query(
-                        &socket,
-                        nameserver,
-                        &qname,
-                        DNS_TYPE_NULL,
-                        &mut dns_id,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break;
-                    }
-                    frag = frag.wrapping_add(1) & 0x0f;
-                    offset = end;
                 }
             }
             recv = socket.recv_from(&mut udp_buf) => {
-                let (len, _peer) = match recv {
-                    Ok(v) => v,
+                match recv {
+                    Ok((len, _peer)) => {
+                        handle_udp_read(&udp_buf[..len], &mut state, &mut tun_device).await;
+                    }
                     Err(err) => {
                         warn!(error = %err, "udp recv_from failed");
-                        continue;
-                    }
-                };
-                let packet = &udp_buf[..len];
-                let mut cur = Cursor::new(packet);
-                let header = match DnsHeader::parse(&mut cur) {
-                    Ok(h) => h,
-                    Err(err) => {
-                        warn!(error = %err, "invalid dns header");
-                        continue;
-                    }
-                };
-                let _question = match DnsQuestion::parse(&mut cur) {
-                    Ok(q) => q,
-                    Err(err) => {
-                        warn!(error = %err, "invalid dns question");
-                        continue;
-                    }
-                };
-                if header.ancount == 0 {
-                    continue;
-                }
-                let rr = match DnsResourceRecord::parse(&mut cur) {
-                    Ok(rr) => rr,
-                    Err(err) => {
-                        warn!(error = %err, "invalid dns answer");
-                        continue;
-                    }
-                };
-                let payload = match rr.rdata {
-                    DnsRdata::Null(data) => {
-                        debug!(rr_type = "NULL", raw_payload_len = data.len(), "downstream rr payload");
-                        data.to_vec()
-                    }
-                    DnsRdata::Txt(data) => {
-                        let txt = flatten_txt_rdata(data);
-                        debug!(rr_type = "TXT", raw_payload_len = txt.len(), "downstream rr payload");
-                        match decode_downstream_txt_payload(&txt) {
-                            Some(v) => v,
-                            None => {
-                                warn!("invalid TXT answer payload encoding");
-                                continue;
-                            }
-                        }
-                    }
-                    _ => continue,
-                };
-                debug!(decoded_payload_len = payload.len(), "downstream rr decoded");
-                if payload.len() < 2 {
-                    continue;
-                }
-
-                let up_ack_seq = (payload[0] >> 4) & 0x07;
-                let up_ack_frag = payload[0] & 0x0f;
-                let down_seq = (payload[1] >> 5) & 0x07;
-                let down_frag = (payload[1] >> 1) & 0x0f;
-                let last_frag = (payload[1] & 0x01) != 0;
-                session.down_ack_seq = down_seq;
-                session.down_ack_frag = down_frag;
-                let fragment = &payload[2..];
-                debug!(
-                    up_ack_seq,
-                    up_ack_frag,
-                    down_seq,
-                    down_frag,
-                    last_frag,
-                    frag_len = fragment.len(),
-                    "downstream fragment header"
-                );
-
-                if let Some(packet) = downstream.push_fragment(down_seq, down_frag, fragment, last_frag) {
-                    let ip_packet = if session.mode == ClientMode::CCompat {
-                        strip_tun_header(&packet)
-                    } else {
-                        &packet
-                    };
-                    debug!(inflated_payload_len = ip_packet.len(), "downstream packet reassembled");
-                    if let Err(err) = tun_device.write_all(ip_packet).await {
-                        warn!(error = %err, "tun write_all failed");
-                        continue;
                     }
                 }
             }
             _ = ping_tick.tick() => {
-                if !session.authenticated {
-                    continue;
-                }
-                if session.mode == ClientMode::CCompat {
-                    let _ = send_c_ping(
-                        &socket,
-                        nameserver,
-                        &topdomain,
-                        &mut dns_id,
-                        PingState {
-                            userid: session.userid,
-                            down_ack_seq: session.down_ack_seq,
-                            down_ack_frag: session.down_ack_frag,
-                        },
-                        &mut session.rand_seed,
-                    )
-                    .await;
-                }
+                handle_ping_tick(&mut state, &socket).await;
             }
         }
     }
+}
+
+#[derive(Debug)]
+struct ClientState {
+    topdomain: String,
+    nameserver: SocketAddr,
+    dns_id: u16,
+    downstream: DownstreamState,
+    session: ClientSession,
+}
+
+/*
+C-compatible upstream DNS data query layout (from upstream `client.c::send_chunk`):
+- The QNAME begins with a fixed 5-byte ASCII header, followed by encoded payload and then `.topdomain`.
+- header[0] = hex userid char (`0-9a-f`)
+- header[1] = b32_5to8((up_seq << 2) | (up_frag >> 2))
+- header[2] = b32_5to8(((up_frag & 0x03) << 3) | down_ack_seq)
+- header[3] = b32_5to8((down_ack_frag << 1) | last_frag_bit)
+- header[4] = data CMC byte (`a-z0-9`, rotating)
+- Encoded payload is ONLY the compressed tunnel packet bytes; no protocol bytes are prepended to payload.
+*/
+async fn handle_tun_read(tun_packet: &[u8], state: &mut ClientState, socket: &UdpSocket) {
+    if !state.session.authenticated || tun_packet.is_empty() {
+        return;
+    }
+    let ip_version = tun_packet[0] >> 4;
+    if ip_version != 4 {
+        debug!(
+            ip_version,
+            len = tun_packet.len(),
+            "ignoring non-ipv4 tun packet"
+        );
+        return;
+    }
+
+    let payload = if state.session.mode == ClientMode::CCompat {
+        with_tun_header(tun_packet)
+    } else {
+        tun_packet.to_vec()
+    };
+    let Some(compressed) = compress_zlib(&payload) else {
+        warn!("failed to compress upstream packet");
+        return;
+    };
+
+    let mut offset = 0usize;
+    let seq = state.session.next_up_seq;
+    state.session.next_up_seq = (state.session.next_up_seq + 1) & 0x07;
+    let mut frag = 0u8;
+    while offset < compressed.len() {
+        let end = (offset + 96).min(compressed.len());
+        let chunk = &compressed[offset..end];
+        let is_last = end == compressed.len();
+        let header = build_upstream_header(
+            state.session.userid_char,
+            seq,
+            frag,
+            state.session.down_ack_seq,
+            state.session.down_ack_frag,
+            is_last,
+            state.session.next_cmc,
+        );
+        state.session.next_cmc = (state.session.next_cmc + 1) % 36;
+        let encoded_chunk = crate::encoding::base32::encode(chunk);
+        let qname = format!(
+            "{header}{}.{}",
+            crate::encoding::inline_dotify(&encoded_chunk),
+            state.topdomain
+        );
+        if send_query(
+            socket,
+            state.nameserver,
+            &qname,
+            DNS_TYPE_NULL,
+            &mut state.dns_id,
+        )
+        .await
+        .is_err()
+        {
+            break;
+        }
+        frag = frag.wrapping_add(1) & 0x0f;
+        offset = end;
+    }
+}
+
+async fn handle_udp_read(
+    udp_packet: &[u8],
+    state: &mut ClientState,
+    tun_device: &mut tun::AsyncDevice,
+) {
+    let mut cur = Cursor::new(udp_packet);
+    let header = match DnsHeader::parse(&mut cur) {
+        Ok(h) => h,
+        Err(err) => {
+            warn!(error = %err, "invalid dns header");
+            return;
+        }
+    };
+    let _question = match DnsQuestion::parse(&mut cur) {
+        Ok(q) => q,
+        Err(err) => {
+            warn!(error = %err, "invalid dns question");
+            return;
+        }
+    };
+    if header.ancount == 0 {
+        return;
+    }
+    let rr = match DnsResourceRecord::parse(&mut cur) {
+        Ok(rr) => rr,
+        Err(err) => {
+            warn!(error = %err, "invalid dns answer");
+            return;
+        }
+    };
+    let payload = match rr.rdata {
+        DnsRdata::Null(data) => {
+            debug!(
+                rr_type = "NULL",
+                raw_payload_len = data.len(),
+                "downstream rr payload"
+            );
+            data.to_vec()
+        }
+        DnsRdata::Txt(data) => {
+            let txt = flatten_txt_rdata(data);
+            debug!(
+                rr_type = "TXT",
+                raw_payload_len = txt.len(),
+                "downstream rr payload"
+            );
+            match decode_downstream_txt_payload(&txt) {
+                Some(v) => v,
+                None => {
+                    warn!("invalid TXT answer payload encoding");
+                    return;
+                }
+            }
+        }
+        _ => return,
+    };
+    debug!(decoded_payload_len = payload.len(), "downstream rr decoded");
+    if payload.len() < 2 {
+        return;
+    }
+
+    let up_ack_seq = (payload[0] >> 4) & 0x07;
+    let up_ack_frag = payload[0] & 0x0f;
+    let down_seq = (payload[1] >> 5) & 0x07;
+    let down_frag = (payload[1] >> 1) & 0x0f;
+    let last_frag = (payload[1] & 0x01) != 0;
+    state.session.down_ack_seq = down_seq;
+    state.session.down_ack_frag = down_frag;
+    let fragment = &payload[2..];
+    debug!(
+        up_ack_seq,
+        up_ack_frag,
+        down_seq,
+        down_frag,
+        last_frag,
+        frag_len = fragment.len(),
+        "downstream fragment header"
+    );
+
+    if let Some(packet) = state
+        .downstream
+        .push_fragment(down_seq, down_frag, fragment, last_frag)
+    {
+        let ip_packet = if state.session.mode == ClientMode::CCompat {
+            strip_tun_header(&packet)
+        } else {
+            &packet
+        };
+        debug!(
+            inflated_payload_len = ip_packet.len(),
+            "downstream packet reassembled"
+        );
+        if let Err(err) = tun_device.write_all(ip_packet).await {
+            warn!(error = %err, "tun write_all failed");
+        }
+    }
+}
+
+async fn handle_ping_tick(state: &mut ClientState, socket: &UdpSocket) {
+    if !state.session.authenticated || state.session.mode != ClientMode::CCompat {
+        return;
+    }
+    let _ = send_c_ping(
+        socket,
+        state.nameserver,
+        &state.topdomain,
+        &mut state.dns_id,
+        PingState {
+            userid: state.session.userid,
+            down_ack_seq: state.session.down_ack_seq,
+            down_ack_frag: state.session.down_ack_frag,
+        },
+        &mut state.session.rand_seed,
+    )
+    .await;
 }
 
 fn build_qname_wire(first_label: &str, topdomain: &str) -> Option<Vec<u8>> {
@@ -448,35 +501,27 @@ async fn perform_handshake(
     udp_buf: &mut [u8; 2048],
     session: &mut ClientSession,
 ) -> Result<(), ClientError> {
-    if let Ok((userid, _seed)) =
-        try_rust_server_handshake(socket, nameserver, topdomain, password, dns_id, udp_buf).await
-    {
-        session.userid = userid;
-        session.userid_char = b"0123456789abcdef"[(userid & 0x0f) as usize];
-        session.mode = ClientMode::RustCompat;
-        session.authenticated = true;
-        return Ok(());
-    }
-
-    let userid =
-        try_c_server_handshake(socket, nameserver, topdomain, password, dns_id, udp_buf).await?;
+    let (userid, mode) =
+        try_handshake(socket, nameserver, topdomain, password, dns_id, udp_buf).await?;
     session.userid = userid;
     session.userid_char = b"0123456789abcdef"[(userid & 0x0f) as usize];
-    session.mode = ClientMode::CCompat;
-    session.rand_seed = 1;
-    session.next_up_seq = 1;
+    session.mode = mode;
+    if mode == ClientMode::CCompat {
+        session.rand_seed = 1;
+        session.next_up_seq = 1;
+    }
     session.authenticated = true;
     Ok(())
 }
 
-async fn try_rust_server_handshake(
+async fn try_handshake(
     socket: &UdpSocket,
     nameserver: SocketAddr,
     topdomain: &str,
     password: &str,
     dns_id: &mut u16,
     udp_buf: &mut [u8; 2048],
-) -> Result<(u8, u32), ClientError> {
+) -> Result<(u8, ClientMode), ClientError> {
     let mut version_payload = [0u8; 6];
     version_payload[..4].copy_from_slice(&0x0000_0502u32.to_be_bytes());
     let vname = build_handshake_name('v', &version_payload, topdomain)?;
@@ -502,53 +547,15 @@ async fn try_rust_server_handshake(
     let login_answer =
         send_and_read_first_answer(socket, nameserver, dns_id, udp_buf, &lname, DNS_TYPE_NULL)
             .await?;
-    if login_answer.starts_with(b"LNAK") {
+    if login_answer.starts_with(b"LNAK") || login_answer.is_empty() {
         return Err(ClientError::Protocol("LNAK".to_string()));
     }
-    if !login_answer.windows(6).any(|w| w == b"-1500-") {
-        return Err(ClientError::Protocol(
-            "server did not match rust login profile".to_string(),
-        ));
-    }
-    Ok((userid, seed))
-}
-
-async fn try_c_server_handshake(
-    socket: &UdpSocket,
-    nameserver: SocketAddr,
-    topdomain: &str,
-    password: &str,
-    dns_id: &mut u16,
-    udp_buf: &mut [u8; 2048],
-) -> Result<u8, ClientError> {
-    let mut version_payload = [0u8; 6];
-    version_payload[..4].copy_from_slice(&0x0000_0502u32.to_be_bytes());
-    let vname = build_handshake_name('v', &version_payload, topdomain)?;
-    let version_answer =
-        send_and_read_first_answer(socket, nameserver, dns_id, udp_buf, &vname, DNS_TYPE_NULL)
-            .await?;
-    if version_answer.len() < 9 || &version_answer[..4] != b"VACK" {
-        return Err(ClientError::Protocol("missing VACK(c)".to_string()));
-    }
-    let seed = u32::from_be_bytes([
-        version_answer[4],
-        version_answer[5],
-        version_answer[6],
-        version_answer[7],
-    ]);
-    let userid = version_answer[8];
-    let login_hash = login_hash(password, seed);
-    let mut login_payload = [0u8; 19];
-    login_payload[0] = userid;
-    login_payload[1..17].copy_from_slice(&login_hash);
-    let lname = build_handshake_name('l', &login_payload, topdomain)?;
-    let login_answer =
-        send_and_read_first_answer(socket, nameserver, dns_id, udp_buf, &lname, DNS_TYPE_NULL)
-            .await?;
-    if login_answer.starts_with(b"LNAK") || login_answer.is_empty() {
-        return Err(ClientError::Protocol("login failed(c)".to_string()));
-    }
-    Ok(userid)
+    let mode = if login_answer.windows(6).any(|w| w == b"-1500-") {
+        ClientMode::RustCompat
+    } else {
+        ClientMode::CCompat
+    };
+    Ok((userid, mode))
 }
 
 fn build_handshake_name(prefix: char, data: &[u8], topdomain: &str) -> Result<String, ClientError> {
@@ -669,7 +676,7 @@ async fn send_c_ping(
 
 fn with_tun_header(ip_packet: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ip_packet.len() + 4);
-    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(&[0x00, 0x00, 0x08, 0x00]);
     out.extend_from_slice(ip_packet);
     out
 }
