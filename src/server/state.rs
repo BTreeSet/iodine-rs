@@ -41,6 +41,7 @@ pub struct Session {
 pub struct ServerState {
     users: RwLock<HashMap<String, User>>,
     sessions_by_id: RwLock<HashMap<u32, Session>>,
+    session_id_by_ip: RwLock<HashMap<Ipv4Addr, u32>>,
     ip_pool: Mutex<IpPool>,
     dns_cache: Mutex<LruCache<Vec<u8>, Bytes>>,
 }
@@ -50,10 +51,9 @@ impl ServerState {
         Self {
             users: RwLock::new(HashMap::new()),
             sessions_by_id: RwLock::new(HashMap::new()),
+            session_id_by_ip: RwLock::new(HashMap::new()),
             ip_pool: Mutex::new(IpPool::new(network, netmask)),
-            dns_cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(1024).expect("cache size should be non-zero"),
-            )),
+            dns_cache: Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap())),
         }
     }
 
@@ -115,7 +115,14 @@ impl ServerState {
             .sessions_by_id
             .write()
             .expect("sessions_by_id lock poisoned during create_session");
-        sessions.insert(user_id, session);
+        sessions.insert(user_id, session.clone());
+        drop(sessions);
+
+        let mut by_ip = self
+            .session_id_by_ip
+            .write()
+            .expect("session_id_by_ip lock poisoned during create_session");
+        by_ip.insert(session.virtual_ip, user_id);
         Ok((user_id, virtual_ip))
     }
 
@@ -161,13 +168,11 @@ impl ServerState {
     }
 
     pub fn find_session_id_by_virtual_ip(&self, virtual_ip: Ipv4Addr) -> Option<u32> {
-        let sessions = self
-            .sessions_by_id
+        let by_ip = self
+            .session_id_by_ip
             .read()
-            .expect("sessions_by_id lock poisoned during find_session_id_by_virtual_ip");
-        sessions.iter().find_map(|(session_id, session)| {
-            (session.virtual_ip == virtual_ip).then_some(*session_id)
-        })
+            .expect("session_id_by_ip lock poisoned during find_session_id_by_virtual_ip");
+        by_ip.get(&virtual_ip).copied()
     }
 }
 

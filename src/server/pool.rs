@@ -18,7 +18,9 @@ impl IpPool {
         let broadcast = base | !mask_u32;
 
         let mut available_set = HashSet::new();
-        if broadcast.saturating_sub(base) > 1 {
+        // Ensure there is at least one assignable host address between
+        // network and broadcast addresses.
+        if broadcast > base + 1 {
             for raw in (base + 1)..broadcast {
                 let ip = Ipv4Addr::from(raw);
                 available.push_back(ip);
