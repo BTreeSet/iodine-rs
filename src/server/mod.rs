@@ -464,7 +464,7 @@ fn handle_control_request(
                 });
             };
             let expected_hash = login_hash(password, seed);
-            if decoded.len() < 17 || decoded[1..17] != expected_hash.as_slice()[..] {
+            if decoded[1..17] != expected_hash.as_slice()[..] {
                 return Some(ControlResponse {
                     rr_type,
                     payload: b"LNAK".to_vec(),
@@ -616,4 +616,28 @@ fn login_hash(password: &str, seed: u32) -> [u8; 16] {
 fn ipv4_netmask_prefix(mask: Ipv4Addr) -> u8 {
     let octets = mask.octets();
     octets.iter().map(|b| b.count_ones() as u8).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::{ipv4_netmask_prefix, login_hash};
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn login_hash_matches_upstream_vector() {
+        let digest = login_hash("iodine is the shit", 15);
+        assert_eq!(to_hex(&digest), "2a8a12b4e042eeabd019171e44a088cd");
+    }
+
+    #[test]
+    fn ipv4_netmask_prefix_calculates_common_masks() {
+        assert_eq!(ipv4_netmask_prefix(Ipv4Addr::new(255, 255, 255, 0)), 24);
+        assert_eq!(ipv4_netmask_prefix(Ipv4Addr::new(255, 255, 0, 0)), 16);
+        assert_eq!(ipv4_netmask_prefix(Ipv4Addr::new(255, 255, 255, 252)), 30);
+    }
 }
