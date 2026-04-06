@@ -36,11 +36,13 @@ fn protocol_base32_matches_upstream_dns_payload() {
     let raw = b"iodinetestingtesting";
     let encoded = base32::encode(raw);
     assert_eq!(encoded, "nfxwi0lomv0gk21unfxgo3dfon0gs1th");
-    assert_eq!(base32::decode(&encoded), raw);
+    assert_eq!(
+        base32::decode(&encoded).expect("valid base32 should decode"),
+        raw
+    );
 }
 
 #[test]
-fn protocol_base32_invalid_input_returns_empty_like_current_impl() {
-    // Current decode behavior is permissive and returns empty output on invalid input.
-    assert!(base32::decode("@@@").is_empty());
+fn protocol_base32_invalid_input_returns_error() {
+    assert!(base32::decode("@@@").is_err());
 }

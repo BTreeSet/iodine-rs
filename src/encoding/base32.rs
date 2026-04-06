@@ -49,13 +49,30 @@ pub fn encode_with_limit(data: &[u8], max_output: usize) -> (String, usize) {
     (IODINE_BASE32.encode(&data[..consumed]), consumed)
 }
 
-pub fn decode(input: &str) -> Vec<u8> {
+pub fn decode(input: &str) -> Result<Vec<u8>, data_encoding::DecodeError> {
     decode_bytes(input.as_bytes())
 }
 
-pub fn decode_bytes(input: &[u8]) -> Vec<u8> {
-    let normalized: Vec<u8> = input.iter().map(|b| b.to_ascii_lowercase()).collect();
-    IODINE_BASE32.decode(&normalized).unwrap_or_default()
+pub fn decode_bytes(input: &[u8]) -> Result<Vec<u8>, data_encoding::DecodeError> {
+    let mut normalized = None;
+    for (idx, &byte) in input.iter().enumerate() {
+        if byte.is_ascii_uppercase() {
+            let mut owned = input.to_vec();
+            owned[idx] = byte.to_ascii_lowercase();
+            for b in &mut owned[idx + 1..] {
+                if b.is_ascii_uppercase() {
+                    *b = b.to_ascii_lowercase();
+                }
+            }
+            normalized = Some(owned);
+            break;
+        }
+    }
+
+    match normalized {
+        Some(owned) => IODINE_BASE32.decode(&owned),
+        None => IODINE_BASE32.decode(input),
+    }
 }
 
 #[cfg(test)]
@@ -74,7 +91,7 @@ mod tests {
 
         for (raw, enc) in pairs {
             assert_eq!(encode(raw), *enc);
-            assert_eq!(decode(enc), *raw);
+            assert_eq!(decode(enc).expect("valid base32 should decode"), *raw);
         }
     }
 
@@ -93,7 +110,7 @@ mod tests {
         assert_eq!(consumed, 5);
         assert_eq!(enc.len(), 8);
 
-        let dec = decode(&enc);
+        let dec = decode(&enc).expect("valid base32 should decode");
         assert_eq!(dec.len(), 5);
         assert!(dec.iter().all(|&b| b == b'A'));
     }
