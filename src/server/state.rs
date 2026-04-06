@@ -105,7 +105,11 @@ impl ServerState {
         Ok((user_id, virtual_ip))
     }
 
-    pub fn queue_downstream_packet(&self, session_id: u32, packet: Bytes) -> Result<(), &'static str> {
+    pub fn queue_downstream_packet(
+        &self,
+        session_id: u32,
+        packet: Bytes,
+    ) -> Result<(), &'static str> {
         let mut sessions = self
             .sessions_by_id
             .write()
@@ -130,10 +134,7 @@ mod tests {
 
     #[test]
     fn add_user_inserts_user_by_username() {
-        let state = ServerState::new(
-            Ipv4Addr::new(10, 0, 0, 0),
-            Ipv4Addr::new(255, 255, 255, 0),
-        );
+        let state = ServerState::new(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0));
         let username = "alice".to_string();
         let password_hash = [0xAB; 16];
 
@@ -148,10 +149,7 @@ mod tests {
 
     #[test]
     fn create_session_acquires_ip_from_pool() {
-        let state = ServerState::new(
-            Ipv4Addr::new(10, 0, 0, 0),
-            Ipv4Addr::new(255, 255, 255, 0),
-        );
+        let state = ServerState::new(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0));
         let username = "alice".to_string();
         let password_hash = [0xCD; 16];
         let id = state.add_user(username.clone(), password_hash);
@@ -166,10 +164,7 @@ mod tests {
 
     #[test]
     fn queue_downstream_packet_drops_oldest_when_capacity_exceeded() {
-        let state = ServerState::new(
-            Ipv4Addr::new(10, 0, 0, 0),
-            Ipv4Addr::new(255, 255, 255, 0),
-        );
+        let state = ServerState::new(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0));
         let username = "alice".to_string();
         let password_hash = [0xEF; 16];
         let session_id = state.add_user(username.clone(), password_hash);
@@ -188,7 +183,7 @@ mod tests {
             .sessions_by_id
             .read()
             .expect("sessions lock should be readable");
-        let queued = sessions
+        let queued = &sessions
             .get(&session_id)
             .expect("session must exist")
             .downstream_queue;

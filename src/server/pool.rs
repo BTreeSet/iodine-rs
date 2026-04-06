@@ -43,7 +43,7 @@ impl IpPool {
         if self.available.contains(&ip) {
             return;
         }
-        self.available.push_back(ip);
+        self.available.push_front(ip);
     }
 }
 
@@ -70,13 +70,12 @@ mod tests {
 
     #[test]
     fn release_makes_address_available_again() {
-        let mut pool = IpPool::new(
-            Ipv4Addr::new(10, 0, 0, 0),
-            Ipv4Addr::new(255, 255, 255, 0),
-        );
+        let mut pool = IpPool::new(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0));
         let leased = pool.acquire().expect("pool should have available address");
         pool.release(leased);
-        let reacquired = pool.acquire().expect("released address should be available");
+        let reacquired = pool
+            .acquire()
+            .expect("released address should be available");
         assert_eq!(reacquired, leased);
     }
 }
