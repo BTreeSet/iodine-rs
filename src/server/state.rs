@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
@@ -45,6 +46,7 @@ pub struct ServerState {
     session_id_by_ip: RwLock<HashMap<Ipv4Addr, u32>>,
     ip_pool: Mutex<IpPool>,
     dns_cache: Mutex<LruCache<Vec<u8>, Bytes>>,
+    next_user_id: AtomicU32,
 }
 
 impl ServerState {
@@ -55,6 +57,7 @@ impl ServerState {
             session_id_by_ip: RwLock::new(HashMap::new()),
             ip_pool: Mutex::new(IpPool::new(network, netmask)),
             dns_cache: Mutex::new(LruCache::new(NonZeroUsize::new(DNS_CACHE_SIZE).unwrap())),
+            next_user_id: AtomicU32::new(1),
         }
     }
 
@@ -63,12 +66,7 @@ impl ServerState {
             .users
             .write()
             .expect("users lock poisoned during add_user");
-        let id = users
-            .values()
-            .map(|user| user.id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+        let id = self.next_user_id.fetch_add(1, Ordering::Relaxed);
         users.insert(
             username.clone(),
             User {
@@ -174,6 +172,21 @@ impl ServerState {
             .read()
             .expect("session_id_by_ip lock poisoned during find_session_id_by_virtual_ip");
         by_ip.get(&virtual_ip).copied()
+    }
+
+    pub fn pop_downstream_packet(&self, session_id: u32) -> Result<Option<Bytes>, ServerError> {
+        let mut sessions = self
+            .sessions_by_id
+            .write()
+            .expect("sessions_by_id lock poisoned during pop_downstream_packet");
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or(ServerError::SessionNotFound)?;
+        let packet = session.downstream_queue.pop_front();
+        if packet.is_some() {
+            session.last_active = Instant::now();
+        }
+        Ok(packet)
     }
 }
 

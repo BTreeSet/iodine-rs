@@ -22,7 +22,7 @@ async fn main() {
 
     let cli = Cli::parse();
     match cli.mode {
-        Mode::Iodine(args) => iodine_rs::client::run(args),
+        Mode::Iodine(args) => iodine_rs::client::run(args).await,
         Mode::Iodined(args) => iodine_rs::server::run(args).await,
     }
 }
