@@ -1,13 +1,27 @@
 use std::net::Ipv4Addr;
 
+const IPV4_MIN_MTU: i32 = 68;
+
 pub fn create_tun_device(
     name: &str,
     address: Ipv4Addr,
     netmask: Ipv4Addr,
     mtu: i32,
 ) -> Result<tun::AsyncDevice, tun::Error> {
-    let mtu = u16::try_from(mtu)
-        .map_err(|_| tun::Error::from(format!("invalid mtu {mtu}; expected 0..={}", u16::MAX)))?;
+    if mtu < IPV4_MIN_MTU {
+        return Err(tun::Error::from(format!(
+            "invalid mtu {mtu}; expected {}..={}",
+            IPV4_MIN_MTU,
+            u16::MAX
+        )));
+    }
+    let mtu = u16::try_from(mtu).map_err(|_| {
+        tun::Error::from(format!(
+            "invalid mtu {mtu}; expected {}..={}",
+            IPV4_MIN_MTU,
+            u16::MAX
+        ))
+    })?;
     let mut config = tun::Configuration::default();
     config
         .tun_name(name)
@@ -31,7 +45,7 @@ mod tests {
             "tun-test",
             Ipv4Addr::new(10, 0, 0, 1),
             Ipv4Addr::new(255, 255, 255, 0),
-            -1,
+            67,
         );
         assert!(result.is_err());
     }
