@@ -37,6 +37,9 @@ pub struct ClientArgs {
     pub tun_ip: String,
     #[arg(long, default_value = "255.255.255.0")]
     pub tun_netmask: String,
+    /// Tunnel password; can also be provided via the IODINE_PASSWORD environment variable.
+    #[arg(long, env = "IODINE_PASSWORD")]
+    pub password: Option<String>,
 }
 
 pub async fn run(args: ClientArgs) {
@@ -61,7 +64,9 @@ pub async fn run(args: ClientArgs) {
     let socket = UdpSocket::bind("0.0.0.0:0")
         .await
         .expect("failed to bind client UDP socket");
-    let password = std::env::var("IODINE_PASSWORD").unwrap_or_else(|_| "testpass".to_string());
+    let password = args
+        .password
+        .expect("tunnel password must be provided via --password or IODINE_PASSWORD");
 
     let mut dns_id: u16 = 1;
     let mut tun_buf = [0u8; 2048];
