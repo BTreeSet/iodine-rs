@@ -46,6 +46,16 @@ print_logs() {
   docker exec client sh -c 'cat /tmp/e2e_client.log 2>/dev/null || true' || true
 }
 
+run_rust_server() {
+  docker exec -e RUST_LOG=trace -e IODINE_PASSWORD="${PASS}" server sh -c \
+    "iodine-server --bind-addr 0.0.0.0:53 --tun-ip ${TUN_SERVER_IP} --topdomain ${DOMAIN} >/tmp/e2e_server.log 2>&1 & echo \$! >/tmp/e2e_server.pid"
+}
+
+run_rust_client() {
+  docker exec -e RUST_LOG=trace client sh -c \
+    "iodine-client --nameserver ${SERVER_IP}:53 --topdomain ${DOMAIN} >/tmp/e2e_client.log 2>&1 & echo \$! >/tmp/e2e_client.pid"
+}
+
 assert_tunnel() {
   if ! wait_for_tun client; then
     print_logs
@@ -73,7 +83,7 @@ trap cleanup EXIT
 "${COMPOSE[@]}" up -d --build
 
 # Test 1: Rust Server -> C Client
-docker exec server sh -c "iodine-server --bind-addr 0.0.0.0:53 --tun-ip ${TUN_SERVER_IP} --topdomain ${DOMAIN} >/tmp/e2e_server.log 2>&1 & echo \$! >/tmp/e2e_server.pid"
+run_rust_server
 sleep "${STARTUP_WAIT_SECONDS}"
 docker exec client sh -c "iodine -P ${PASS} ${SERVER_IP} ${DOMAIN} >/tmp/e2e_client.log 2>&1 & echo \$! >/tmp/e2e_client.pid"
 assert_tunnel
@@ -84,15 +94,15 @@ cleanup
 # Test 2: C Server -> Rust Client
 docker exec server sh -c "iodined -c -P ${PASS} ${TUN_SERVER_IP} ${DOMAIN} >/tmp/e2e_server.log 2>&1 & echo \$! >/tmp/e2e_server.pid"
 sleep "${STARTUP_WAIT_SECONDS}"
-docker exec client sh -c "iodine-client --nameserver ${SERVER_IP}:53 --topdomain ${DOMAIN} >/tmp/e2e_client.log 2>&1 & echo \$! >/tmp/e2e_client.pid"
+run_rust_client
 assert_tunnel
 assert_ping normal
 cleanup
 "${COMPOSE[@]}" up -d
 
 # Test 3: Rust Server -> Rust Client (fragmentation stress)
-docker exec server sh -c "iodine-server --bind-addr 0.0.0.0:53 --tun-ip ${TUN_SERVER_IP} --topdomain ${DOMAIN} >/tmp/e2e_server.log 2>&1 & echo \$! >/tmp/e2e_server.pid"
+run_rust_server
 sleep "${STARTUP_WAIT_SECONDS}"
-docker exec client sh -c "iodine-client --nameserver ${SERVER_IP}:53 --topdomain ${DOMAIN} >/tmp/e2e_client.log 2>&1 & echo \$! >/tmp/e2e_client.pid"
+run_rust_client
 assert_tunnel
 assert_ping stress

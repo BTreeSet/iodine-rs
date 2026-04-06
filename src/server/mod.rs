@@ -1,11 +1,25 @@
+//! Protocol 0x00000502 compatibility notes (upstream `iodined.c`):
+//! - The C server does **not** assume every query label is upstream packet data.
+//!   It first validates that query names are under `topdomain`, then dispatches
+//!   control probes by first label (`V`, `L`, `Y`, `R`, etc.) across NULL/TXT/SRV/MX/A/CNAME.
+//! - During client startup, C client autodetects DNS query type *before* login by
+//!   sending `y<codec><variant><cmc>.topdomain` and expects `DOWNCODECCHECK1` payload back
+//!   with a matching DNS answer type; no tunnel session payload is required yet.
+//! - Our previous Rust server attempted to base32-decode the first label unconditionally as
+//!   TUN upstream bytes, so control probes (e.g. `y...`) were dropped as decode failures.
+//! - The C handshake sequence then sends `V` (version) and `L` (login MD5 challenge response).
+//!   Without these control handlers, C clients stay stuck at autodetect/version/login.
+//! - This module now prioritizes control probe/handshake dispatch (`Y`, `V`, `L`) and only
+//!   treats labels as upstream data when no control command matches.
 use clap::Args;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 pub mod pool;
 pub mod state;
@@ -17,6 +31,12 @@ use crate::dns::{
 
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV4_DST_OFFSET: usize = 16;
+const PROTOCOL_VERSION: u32 = 0x0000_0502;
+const DNS_FLAGS_RESPONSE_RA: u16 = 0x8000 | 0x0080;
+const DEFAULT_PASSWORD: &str = "testpass";
+const DOWNCODECCHECK1: &[u8] = b"\x00\x00\x00\x00\xFF\xFF\xFF\xFF\x55\x55\x55\x55\xAA\xAA\xAA\xAA\
+\x81\x63\xC8\xD2\xC7\x7C\xB2\x17\x5F\x4F\xCE\xC9\x49\x2D\x52\x21\
+\x61\xA9\x71\x20\x25\xB3\x06\x73\xE6\xD8\x44\x30\x79\x50\x57\xBF";
 
 #[derive(Debug, Clone, Args)]
 pub struct ServerArgs {
@@ -33,6 +53,11 @@ pub struct ServerArgs {
 }
 
 pub async fn run(args: ServerArgs) {
+    let topdomain = args
+        .topdomain
+        .unwrap_or_else(|| "testdomain.com".to_string())
+        .trim_matches('.')
+        .to_ascii_lowercase();
     let bind_addr: SocketAddr = args
         .bind_addr
         .as_deref()
@@ -51,6 +76,8 @@ pub async fn run(args: ServerArgs) {
         .tun_netmask
         .parse()
         .expect("tun_netmask must be a valid IPv4 address");
+    let password =
+        std::env::var("IODINE_PASSWORD").unwrap_or_else(|_| DEFAULT_PASSWORD.to_string());
 
     let state = ServerState::new(tun_network, tun_netmask);
     let mut tun_device = crate::tun::create_tun_device("iodine0", tun_ip, tun_netmask, 1500)
@@ -64,9 +91,11 @@ pub async fn run(args: ServerArgs) {
     let socket = UdpSocket::bind(bind_addr)
         .await
         .expect("failed to bind UDP socket");
+    info!(%bind_addr, %topdomain, "Server listening on UDP DNS socket");
 
     let mut udp_buf = [0u8; 2048];
     let mut tun_buf = [0u8; 2048];
+    let mut handshake = HandshakeState::default();
 
     loop {
         tokio::select! {
@@ -79,6 +108,7 @@ pub async fn run(args: ServerArgs) {
                     }
                 };
                 let packet = &udp_buf[..len];
+                debug!(bytes = len, ?peer, packet = ?packet, "Received packet");
                 let mut cur = Cursor::new(packet);
                 let header = match DnsHeader::parse(&mut cur) {
                     Ok(header) => header,
@@ -94,7 +124,6 @@ pub async fn run(args: ServerArgs) {
                         continue;
                     }
                 };
-
                 let first_label = match first_label_bytes(question.qname_wire) {
                     Some(label) => label,
                     None => {
@@ -102,10 +131,50 @@ pub async fn run(args: ServerArgs) {
                         continue;
                     }
                 };
+
+                if !qname_matches_topdomain(question.qname_wire, &topdomain) {
+                    warn!("dropping packet: qname outside configured topdomain");
+                    continue;
+                }
+
+                if let Some(control_response) = handle_control_request(
+                    first_label,
+                    question.qtype,
+                    &state,
+                    &mut handshake,
+                    &password,
+                    tun_ip,
+                    tun_netmask,
+                ) {
+                    let mut response = BytesMut::with_capacity(2048);
+                    let response_header = DnsHeader {
+                        id: header.id,
+                        flags: (header.flags | DNS_FLAGS_RESPONSE_RA) & !0x0200,
+                        qdcount: 1,
+                        ancount: 1,
+                        nscount: 0,
+                        arcount: 0,
+                    };
+                    response_header.write_to(&mut response);
+                    question.write_to(&mut response);
+                    DnsResourceRecord {
+                        name_wire: question.qname_wire,
+                        rr_type: control_response.rr_type,
+                        class: DNS_CLASS_IN,
+                        ttl: 0,
+                        rdata: control_rdata(control_response.rr_type, &control_response.payload),
+                    }
+                    .write_to(&mut response);
+                    if let Err(err) = socket.send_to(&response, peer).await {
+                        warn!(error = %err, "udp send_to control response failed");
+                    }
+                    continue;
+                }
+
                 let upstream_packet = match crate::encoding::base32::decode_bytes(first_label) {
                     Ok(data) => data,
                     Err(err) => {
-                        warn!(error = %err, "failed to decode upstream base32 payload");
+                        warn!(error = %err, "dropping packet: failed to decode upstream base32 payload");
                         continue;
                     }
                 };
@@ -119,7 +188,7 @@ pub async fn run(args: ServerArgs) {
                 let downstream = match state.pop_downstream_packet(bootstrap_session_id) {
                     Ok(packet) => packet,
                     Err(ServerError::SessionNotFound) => {
-                        warn!("session not found while dequeuing downstream packet");
+                        warn!("dropping packet: session not found while dequeuing downstream packet");
                         continue;
                     }
                     Err(err) => {
@@ -204,4 +273,218 @@ fn first_label_bytes(qname_wire: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(&qname_wire[1..=len])
+}
+
+fn qname_matches_topdomain(qname_wire: &[u8], topdomain: &str) -> bool {
+    let qname = qname_to_string(qname_wire);
+    if qname.is_empty() {
+        return false;
+    }
+    let qname = qname.to_ascii_lowercase();
+    qname == topdomain || qname.ends_with(&format!(".{topdomain}"))
+}
+
+fn qname_to_string(qname_wire: &[u8]) -> String {
+    let mut labels = Vec::new();
+    let mut pos = 0usize;
+    while pos < qname_wire.len() {
+        let len = qname_wire[pos] as usize;
+        pos += 1;
+        if len == 0 {
+            break;
+        }
+        if pos + len > qname_wire.len() {
+            break;
+        }
+        labels.push(String::from_utf8_lossy(&qname_wire[pos..pos + len]).to_string());
+        pos += len;
+    }
+    labels.join(".")
+}
+
+fn response_rr_type(request_qtype: u16) -> u16 {
+    if request_qtype == DNS_TYPE_TXT {
+        DNS_TYPE_TXT
+    } else {
+        DNS_TYPE_NULL
+    }
+}
+
+struct ControlResponse {
+    rr_type: u16,
+    payload: Vec<u8>,
+}
+
+struct HandshakeState {
+    next_handshake_userid: u8,
+    login_challenge_seed: u32,
+    pending_login_challenges: HashMap<u8, u32>,
+}
+
+impl Default for HandshakeState {
+    fn default() -> Self {
+        Self {
+            next_handshake_userid: 1,
+            login_challenge_seed: 0x0102_0304,
+            pending_login_challenges: HashMap::new(),
+        }
+    }
+}
+
+fn handle_control_request(
+    first_label: &[u8],
+    request_qtype: u16,
+    state: &ServerState,
+    handshake: &mut HandshakeState,
+    password: &str,
+    tun_ip: Ipv4Addr,
+    tun_netmask: Ipv4Addr,
+) -> Option<ControlResponse> {
+    let first_char = *first_label.first()?;
+    let rr_type = response_rr_type(request_qtype);
+    match first_char.to_ascii_lowercase() {
+        b'y' => {
+            if first_label.len() < 3 {
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: b"BADLEN".to_vec(),
+                });
+            }
+            let requested_codec = first_label[1].to_ascii_uppercase();
+            let supports_codec = match requested_codec {
+                b'R' => request_qtype == DNS_TYPE_NULL || request_qtype == DNS_TYPE_TXT,
+                b'T' | b'S' | b'U' | b'V' => true,
+                _ => false,
+            };
+            if !supports_codec {
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: b"BADCODEC".to_vec(),
+                });
+            }
+            let variant = decode_base32_char(first_label[2]).unwrap_or(0);
+            if variant != 1 {
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: b"BADLEN".to_vec(),
+                });
+            }
+            Some(ControlResponse {
+                rr_type,
+                payload: DOWNCODECCHECK1.to_vec(),
+            })
+        }
+        b'v' => {
+            let decoded = crate::encoding::base32::decode_bytes(&first_label[1..]).ok()?;
+            if decoded.len() < 4 {
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: b"VNAK\0\0\0\0\0".to_vec(),
+                });
+            }
+            let version = u32::from_be_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]);
+            if version == PROTOCOL_VERSION {
+                let userid = handshake.next_handshake_userid;
+                handshake.next_handshake_userid =
+                    handshake.next_handshake_userid.wrapping_add(1).max(1);
+                let seed = handshake.login_challenge_seed;
+                handshake.login_challenge_seed =
+                    handshake.login_challenge_seed.wrapping_add(0x1021);
+                handshake.pending_login_challenges.insert(userid, seed);
+                let mut out = Vec::with_capacity(9);
+                out.extend_from_slice(b"VACK");
+                out.extend_from_slice(&seed.to_be_bytes());
+                out.push(userid);
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: out,
+                });
+            }
+            let mut out = Vec::with_capacity(9);
+            out.extend_from_slice(b"VNAK");
+            out.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+            out.push(0);
+            Some(ControlResponse {
+                rr_type,
+                payload: out,
+            })
+        }
+        b'l' => {
+            let decoded = crate::encoding::base32::decode_bytes(&first_label[1..]).ok()?;
+            if decoded.len() < 17 {
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: b"BADLEN".to_vec(),
+                });
+            }
+            let userid = decoded[0];
+            let Some(seed) = handshake.pending_login_challenges.get(&userid).copied() else {
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: b"BADIP".to_vec(),
+                });
+            };
+            let expected_hash = login_hash(password, seed);
+            if decoded.len() < 17 || decoded[1..17] != expected_hash.as_slice()[..] {
+                return Some(ControlResponse {
+                    rr_type,
+                    payload: b"LNAK".to_vec(),
+                });
+            }
+            let mut supplied_hash = [0u8; 16];
+            supplied_hash.copy_from_slice(&decoded[1..17]);
+            let username = format!("user-{userid}");
+            state.add_user(username.clone(), supplied_hash);
+            let client_ip = match state.create_session(&username, supplied_hash) {
+                Ok((_, ip)) => ip,
+                Err(err) => {
+                    warn!(error = %err, userid, "dropping packet: session allocation failed during login");
+                    Ipv4Addr::new(10, 0, 0, 2)
+                }
+            };
+            handshake.pending_login_challenges.remove(&userid);
+            let payload = format!(
+                "{}-{}-1500-{}",
+                tun_ip,
+                client_ip,
+                ipv4_netmask_prefix(tun_netmask)
+            )
+            .into_bytes();
+            Some(ControlResponse { rr_type, payload })
+        }
+        _ => None,
+    }
+}
+
+fn decode_base32_char(ch: u8) -> Option<u8> {
+    match ch.to_ascii_lowercase() {
+        b'a'..=b'z' => Some(ch.to_ascii_lowercase() - b'a'),
+        b'0'..=b'5' => Some(26 + (ch - b'0')),
+        _ => None,
+    }
+}
+
+fn control_rdata<'a>(rr_type: u16, payload: &'a [u8]) -> DnsRdata<'a> {
+    if rr_type == DNS_TYPE_TXT {
+        DnsRdata::Txt(payload)
+    } else {
+        DnsRdata::Null(payload)
+    }
+}
+
+fn login_hash(password: &str, seed: u32) -> [u8; 16] {
+    let mut temp = [0u8; 32];
+    let pass_bytes = password.as_bytes();
+    let copy_len = pass_bytes.len().min(32);
+    temp[..copy_len].copy_from_slice(&pass_bytes[..copy_len]);
+    for chunk in temp.chunks_exact_mut(4) {
+        let n = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ seed;
+        chunk.copy_from_slice(&n.to_be_bytes());
+    }
+    crate::crypto::md5::compute_md5(&temp)
+}
+
+fn ipv4_netmask_prefix(mask: Ipv4Addr) -> u8 {
+    let octets = mask.octets();
+    octets.iter().map(|b| b.count_ones() as u8).sum()
 }
