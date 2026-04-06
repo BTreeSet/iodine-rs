@@ -1,17 +1,26 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
+use std::num::NonZeroUsize;
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 use bytes::Bytes;
+use lru::LruCache;
 
 use crate::server::pool::IpPool;
 use tracing::debug;
 
-const SESSION_NOT_FOUND: &str = "session not found";
-const AUTH_FAILED: &str = "authentication failed";
-const NO_IP_AVAILABLE: &str = "no ip address available";
 const MAX_DOWNSTREAM_QUEUE: usize = 128;
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub enum ServerError {
+    #[error("session not found")]
+    SessionNotFound,
+    #[error("authentication failed")]
+    AuthFailed,
+    #[error("no ip address available")]
+    NoIpAvailable,
+}
 
 #[derive(Debug, Clone)]
 pub struct User {
@@ -33,6 +42,7 @@ pub struct ServerState {
     users: RwLock<HashMap<String, User>>,
     sessions_by_id: RwLock<HashMap<u32, Session>>,
     ip_pool: Mutex<IpPool>,
+    dns_cache: Mutex<LruCache<Vec<u8>, Bytes>>,
 }
 
 impl ServerState {
@@ -41,6 +51,9 @@ impl ServerState {
             users: RwLock::new(HashMap::new()),
             sessions_by_id: RwLock::new(HashMap::new()),
             ip_pool: Mutex::new(IpPool::new(network, netmask)),
+            dns_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(1024).expect("cache size should be non-zero"),
+            )),
         }
     }
 
@@ -81,16 +94,16 @@ impl ServerState {
         &self,
         username: &str,
         password_hash: [u8; 16],
-    ) -> Result<(u32, Ipv4Addr), &'static str> {
+    ) -> Result<(u32, Ipv4Addr), ServerError> {
         let user_id = self
             .authenticate_user(username, password_hash)
-            .ok_or(AUTH_FAILED)?;
+            .ok_or(ServerError::AuthFailed)?;
         let virtual_ip = {
             let mut pool = self
                 .ip_pool
                 .lock()
                 .expect("ip_pool lock poisoned during create_session");
-            pool.acquire().ok_or(NO_IP_AVAILABLE)?
+            pool.acquire().ok_or(ServerError::NoIpAvailable)?
         };
         let session = Session {
             user_id,
@@ -110,12 +123,14 @@ impl ServerState {
         &self,
         session_id: u32,
         packet: Bytes,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), ServerError> {
         let mut sessions = self
             .sessions_by_id
             .write()
             .expect("sessions_by_id lock poisoned during queue_downstream_packet");
-        let session = sessions.get_mut(&session_id).ok_or(SESSION_NOT_FOUND)?;
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or(ServerError::SessionNotFound)?;
         if session.downstream_queue.len() >= MAX_DOWNSTREAM_QUEUE {
             session.downstream_queue.pop_front();
             debug!(
@@ -128,6 +143,32 @@ impl ServerState {
         session.last_active = Instant::now();
         Ok(())
     }
+
+    pub fn check_cache(&self, query: &[u8]) -> Option<Bytes> {
+        let mut cache = self
+            .dns_cache
+            .lock()
+            .expect("dns_cache lock poisoned during check_cache");
+        cache.get(query).cloned()
+    }
+
+    pub fn put_cache(&self, query: Vec<u8>, response: Bytes) {
+        let mut cache = self
+            .dns_cache
+            .lock()
+            .expect("dns_cache lock poisoned during put_cache");
+        cache.put(query, response);
+    }
+
+    pub fn find_session_id_by_virtual_ip(&self, virtual_ip: Ipv4Addr) -> Option<u32> {
+        let sessions = self
+            .sessions_by_id
+            .read()
+            .expect("sessions_by_id lock poisoned during find_session_id_by_virtual_ip");
+        sessions.iter().find_map(|(session_id, session)| {
+            (session.virtual_ip == virtual_ip).then_some(*session_id)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -136,7 +177,7 @@ mod tests {
 
     use bytes::Bytes;
 
-    use super::ServerState;
+    use super::{ServerError, ServerState};
 
     #[test]
     fn add_user_inserts_user_by_username() {
@@ -198,6 +239,34 @@ mod tests {
 
         assert_eq!(session_id, id);
         assert_eq!(virtual_ip, Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn create_session_returns_auth_failed_for_wrong_credentials() {
+        let state = ServerState::new(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0));
+        let username = "alice".to_string();
+        let password_hash = [0x01; 16];
+        state.add_user(username.clone(), password_hash);
+
+        let result = state.create_session(&username, [0x02; 16]);
+        assert_eq!(result, Err(ServerError::AuthFailed));
+    }
+
+    #[test]
+    fn queue_downstream_packet_returns_not_found_when_missing_session() {
+        let state = ServerState::new(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0));
+        let result = state.queue_downstream_packet(99, Bytes::from_static(b"pkt"));
+        assert_eq!(result, Err(ServerError::SessionNotFound));
+    }
+
+    #[test]
+    fn dns_cache_round_trip() {
+        let state = ServerState::new(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 0));
+        let query = vec![1, 2, 3, 4];
+        let response = Bytes::from_static(b"response");
+        assert_eq!(state.check_cache(&query), None);
+        state.put_cache(query.clone(), response.clone());
+        assert_eq!(state.check_cache(&query), Some(response));
     }
 
     #[test]
