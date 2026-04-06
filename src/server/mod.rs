@@ -1,5 +1,6 @@
 use clap::Args;
 
+pub mod pool;
 pub mod state;
 
 #[derive(Debug, Clone, Args)]
