@@ -33,7 +33,8 @@ const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV4_DST_OFFSET: usize = 16;
 const PROTOCOL_VERSION: u32 = 0x0000_0502;
 const DNS_FLAGS_RESPONSE_RA: u16 = 0x8000 | 0x0080;
-const DEFAULT_PASSWORD: &str = "testpass";
+const DNS_FLAGS_CLEAR_AA_MASK: u16 = !0x0200;
+const CONTROL_BADLEN: &[u8] = b"BADLEN";
 const DOWNCODECCHECK1: &[u8] = b"\x00\x00\x00\x00\xFF\xFF\xFF\xFF\x55\x55\x55\x55\xAA\xAA\xAA\xAA\
 \x81\x63\xC8\xD2\xC7\x7C\xB2\x17\x5F\x4F\xCE\xC9\x49\x2D\x52\x21\
 \x61\xA9\x71\x20\x25\xB3\x06\x73\xE6\xD8\x44\x30\x79\x50\x57\xBF";
@@ -76,8 +77,8 @@ pub async fn run(args: ServerArgs) {
         .tun_netmask
         .parse()
         .expect("tun_netmask must be a valid IPv4 address");
-    let password =
-        std::env::var("IODINE_PASSWORD").unwrap_or_else(|_| DEFAULT_PASSWORD.to_string());
+    let password = std::env::var("IODINE_PASSWORD")
+        .expect("IODINE_PASSWORD must be set for protocol-compatible login handling");
 
     let state = ServerState::new(tun_network, tun_netmask);
     let mut tun_device = {
@@ -166,7 +167,8 @@ pub async fn run(args: ServerArgs) {
                     let mut response = BytesMut::with_capacity(2048);
                     let response_header = DnsHeader {
                         id: header.id,
-                        flags: (header.flags | DNS_FLAGS_RESPONSE_RA) & !0x0200,
+                        // Clear AA bit to match existing response behavior while setting QR+RA.
+                        flags: (header.flags | DNS_FLAGS_RESPONSE_RA) & DNS_FLAGS_CLEAR_AA_MASK,
                         qdcount: 1,
                         ancount: 1,
                         nscount: 0,
@@ -218,7 +220,8 @@ pub async fn run(args: ServerArgs) {
                 let answer_count = if downstream.is_some() { 1 } else { 0 };
                 let response_header = DnsHeader {
                     id: header.id,
-                    flags: (header.flags | 0x8000 | 0x0080) & !0x0200,
+                    // Clear AA bit to match existing response behavior while setting QR+RA.
+                    flags: (header.flags | 0x8000 | 0x0080) & DNS_FLAGS_CLEAR_AA_MASK,
                     qdcount: 1,
                     ancount: answer_count,
                     nscount: 0,
@@ -386,7 +389,7 @@ fn handle_control_request(
             if query.first_label.len() < 3 {
                 return Some(ControlResponse {
                     rr_type,
-                    payload: b"BADLEN".to_vec(),
+                    payload: CONTROL_BADLEN.to_vec(),
                 });
             }
             let requested_codec = query.first_label[1].to_ascii_uppercase();
@@ -405,7 +408,7 @@ fn handle_control_request(
             if variant != 1 {
                 return Some(ControlResponse {
                     rr_type,
-                    payload: b"BADLEN".to_vec(),
+                    payload: CONTROL_BADLEN.to_vec(),
                 });
             }
             Some(ControlResponse {
@@ -453,7 +456,7 @@ fn handle_control_request(
             if decoded.len() < 17 {
                 return Some(ControlResponse {
                     rr_type,
-                    payload: b"BADLEN".to_vec(),
+                    payload: CONTROL_BADLEN.to_vec(),
                 });
             }
             let userid = decoded[0];
@@ -464,7 +467,7 @@ fn handle_control_request(
                 });
             };
             let expected_hash = login_hash(password, seed);
-            if decoded[1..17] != expected_hash.as_slice()[..] {
+            if !constant_time_eq_16(&decoded[1..17], &expected_hash) {
                 return Some(ControlResponse {
                     rr_type,
                     payload: b"LNAK".to_vec(),
@@ -505,7 +508,7 @@ fn handle_control_request(
             if query.first_label.len() < 3 {
                 return Some(ControlResponse {
                     rr_type,
-                    payload: b"BADLEN".to_vec(),
+                    payload: CONTROL_BADLEN.to_vec(),
                 });
             }
             let codec = decode_base32_char(query.first_label[2]).unwrap_or(0);
@@ -522,7 +525,7 @@ fn handle_control_request(
             if query.first_label.len() < 3 {
                 return Some(ControlResponse {
                     rr_type,
-                    payload: b"BADLEN".to_vec(),
+                    payload: CONTROL_BADLEN.to_vec(),
                 });
             }
             let payload = match query.first_label[2].to_ascii_lowercase() {
@@ -541,7 +544,7 @@ fn handle_control_request(
             if query.first_label.len() < 4 {
                 return Some(ControlResponse {
                     rr_type,
-                    payload: b"BADLEN".to_vec(),
+                    payload: CONTROL_BADLEN.to_vec(),
                 });
             }
             let c1 = decode_base32_char(query.first_label[1]).unwrap_or(0);
@@ -572,7 +575,7 @@ fn handle_control_request(
             if decoded.len() < 3 {
                 return Some(ControlResponse {
                     rr_type,
-                    payload: b"BADLEN".to_vec(),
+                    payload: CONTROL_BADLEN.to_vec(),
                 });
             }
             let frag = u16::from_be_bytes([decoded[1], decoded[2]]);
@@ -611,6 +614,17 @@ fn login_hash(password: &str, seed: u32) -> [u8; 16] {
         chunk.copy_from_slice(&n.to_be_bytes());
     }
     crate::crypto::md5::compute_md5(&temp)
+}
+
+fn constant_time_eq_16(a: &[u8], b: &[u8; 16]) -> bool {
+    if a.len() != 16 {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..16 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 fn ipv4_netmask_prefix(mask: Ipv4Addr) -> u8 {
