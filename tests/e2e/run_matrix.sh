@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+cd "${REPO_ROOT}"
+git submodule update --init --recursive
+cd "${SCRIPT_DIR}"
+
 if command -v docker-compose >/dev/null 2>&1; then
   COMPOSE=(docker-compose)
 else
@@ -52,8 +59,8 @@ run_rust_server() {
 }
 
 run_rust_client() {
-  docker exec -e RUST_LOG=trace client sh -c \
-    "iodine-client --nameserver ${SERVER_IP}:53 --topdomain ${DOMAIN} >/tmp/e2e_client.log 2>&1 & echo \$! >/tmp/e2e_client.pid"
+  docker exec -e RUST_LOG=trace -e IODINE_PASSWORD="${PASS}" client sh -c \
+    "iodine-client -P ${PASS} ${SERVER_IP}:53 ${DOMAIN} >/tmp/e2e_client.log 2>&1 & echo \$! >/tmp/e2e_client.pid"
 }
 
 assert_tunnel() {

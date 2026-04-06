@@ -29,6 +29,12 @@ use crate::dns::{
 
 #[derive(Debug, Clone, Args)]
 pub struct ClientArgs {
+    /// Server DNS endpoint (ip[:port]); C-style positional argument.
+    #[arg(index = 1)]
+    pub nameserver_pos: Option<String>,
+    /// Tunnel topdomain; C-style positional argument.
+    #[arg(index = 2)]
+    pub topdomain_pos: Option<String>,
     #[arg(long)]
     pub topdomain: Option<String>,
     #[arg(long)]
@@ -38,14 +44,18 @@ pub struct ClientArgs {
     #[arg(long, default_value = "255.255.255.0")]
     pub tun_netmask: String,
     /// Tunnel password; can also be provided via the IODINE_PASSWORD environment variable.
-    #[arg(long, env = "IODINE_PASSWORD")]
+    #[arg(short = 'P', long = "password", env = "IODINE_PASSWORD")]
     pub password: Option<String>,
 }
 
 pub async fn run(args: ClientArgs) {
-    let topdomain = args.topdomain.unwrap_or_else(|| "t1.example".to_string());
+    let topdomain = args
+        .topdomain
+        .or(args.topdomain_pos)
+        .unwrap_or_else(|| "t1.example".to_string());
     let nameserver: SocketAddr = args
         .nameserver
+        .or(args.nameserver_pos)
         .as_deref()
         .unwrap_or("127.0.0.1:53")
         .parse()
@@ -100,6 +110,14 @@ pub async fn run(args: ClientArgs) {
                     }
                 };
                 if !session.authenticated {
+                    continue;
+                }
+                if len == 0 {
+                    continue;
+                }
+                let ip_version = tun_buf[0] >> 4;
+                if ip_version != 4 {
+                    debug!(ip_version, len, "ignoring non-ipv4 tun packet");
                     continue;
                 }
                 let packet = if session.mode == ClientMode::CCompat {
@@ -242,7 +260,7 @@ pub async fn run(args: ClientArgs) {
                 if !session.authenticated {
                     continue;
                 }
-                if session.mode == ClientMode::CCompat || session.mode == ClientMode::RawC {
+                if session.mode == ClientMode::CCompat {
                     let _ = send_c_ping(
                         &socket,
                         nameserver,
@@ -411,7 +429,6 @@ enum ClientMode {
     #[default]
     RustCompat,
     CCompat,
-    RawC,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -449,9 +466,6 @@ async fn perform_handshake(
     session.rand_seed = 1;
     session.next_up_seq = 1;
     session.authenticated = true;
-    if try_raw_udp_login(socket, nameserver, password, userid, dns_id, udp_buf).await? {
-        session.mode = ClientMode::RawC;
-    }
     Ok(())
 }
 
@@ -490,6 +504,11 @@ async fn try_rust_server_handshake(
             .await?;
     if login_answer.starts_with(b"LNAK") {
         return Err(ClientError::Protocol("LNAK".to_string()));
+    }
+    if !login_answer.windows(6).any(|w| w == b"-1500-") {
+        return Err(ClientError::Protocol(
+            "server did not match rust login profile".to_string(),
+        ));
     }
     Ok((userid, seed))
 }
@@ -530,33 +549,6 @@ async fn try_c_server_handshake(
         return Err(ClientError::Protocol("login failed(c)".to_string()));
     }
     Ok(userid)
-}
-
-async fn try_raw_udp_login(
-    socket: &UdpSocket,
-    nameserver: SocketAddr,
-    password: &str,
-    userid: u8,
-    _dns_id: &mut u16,
-    udp_buf: &mut [u8; 2048],
-) -> Result<bool, ClientError> {
-    let probe_hash = login_hash(password, 1);
-    let mut payload = Vec::with_capacity(4 + 16);
-    payload.extend_from_slice(&[0x10, 0xd1, 0x9e]);
-    payload.push(0x10 | (userid & 0x0f));
-    payload.extend_from_slice(&probe_hash);
-    socket
-        .send_to(&payload, nameserver)
-        .await
-        .map_err(|e| ClientError::Io(format!("raw login send failed: {e}")))?;
-    let recv = timeout(Duration::from_millis(700), socket.recv_from(udp_buf)).await;
-    let Ok(Ok((len, _))) = recv else {
-        return Ok(false);
-    };
-    if len < 4 {
-        return Ok(false);
-    }
-    Ok(udp_buf[0] == 0x10 && udp_buf[1] == 0xd1 && udp_buf[2] == 0x9e)
 }
 
 fn build_handshake_name(prefix: char, data: &[u8], topdomain: &str) -> Result<String, ClientError> {
