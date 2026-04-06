@@ -61,6 +61,7 @@ pub async fn run(args: ClientArgs) {
                     }
                 };
                 let encoded = crate::encoding::base32::encode(&tun_buf[..len]);
+                let encoded = crate::encoding::inline_dotify(&encoded);
                 let qname_wire = match build_qname_wire(&encoded, &topdomain) {
                     Some(v) => v,
                     None => {
@@ -159,12 +160,17 @@ pub async fn run(args: ClientArgs) {
 }
 
 fn build_qname_wire(first_label: &str, topdomain: &str) -> Option<Vec<u8>> {
-    if first_label.is_empty() || first_label.len() > 63 {
+    if first_label.is_empty() {
         return None;
     }
     let mut out = Vec::with_capacity(first_label.len() + topdomain.len() + 4);
-    out.push(first_label.len() as u8);
-    out.extend_from_slice(first_label.as_bytes());
+    for part in first_label.split('.') {
+        if part.is_empty() || part.len() > 63 {
+            return None;
+        }
+        out.push(part.len() as u8);
+        out.extend_from_slice(part.as_bytes());
+    }
     for part in topdomain.trim_matches('.').split('.') {
         if part.is_empty() || part.len() > 63 {
             return None;
