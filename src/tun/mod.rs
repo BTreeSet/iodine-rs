@@ -1,7 +1,38 @@
-pub fn create_tun_device(name: &str, mtu: i32) -> Result<tun::AsyncDevice, tun::Error> {
+use std::net::Ipv4Addr;
+
+pub fn create_tun_device(
+    name: &str,
+    address: Ipv4Addr,
+    netmask: Ipv4Addr,
+    mtu: i32,
+) -> Result<tun::AsyncDevice, tun::Error> {
     let mtu = u16::try_from(mtu)
         .map_err(|_| tun::Error::from(format!("invalid mtu {mtu}; expected 0..={}", u16::MAX)))?;
     let mut config = tun::Configuration::default();
-    config.tun_name(name).mtu(mtu).layer(tun::Layer::L3);
+    config
+        .tun_name(name)
+        .address(address)
+        .netmask(netmask)
+        .mtu(mtu)
+        .layer(tun::Layer::L3)
+        .up();
     tun::create_as_async(&config)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::create_tun_device;
+
+    #[test]
+    fn create_tun_device_rejects_invalid_mtu_before_syscall() {
+        let result = create_tun_device(
+            "tun-test",
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(255, 255, 255, 0),
+            -1,
+        );
+        assert!(result.is_err());
+    }
 }
