@@ -127,10 +127,22 @@ pub async fn run(args: ClientArgs) {
                     }
                 };
                 let decoded = match rr.rdata {
-                    DnsRdata::Null(data) => crate::encoding::base64::decode_bytes(data),
+                    DnsRdata::Null(data) => match decode_base64_payload(data) {
+                        Some(v) => v,
+                        None => {
+                            warn!("invalid NULL answer payload encoding");
+                            continue;
+                        }
+                    },
                     DnsRdata::Txt(data) => {
                         let txt = flatten_txt_rdata(data);
-                        crate::encoding::base64::decode_bytes(&txt)
+                        match decode_base64_payload(&txt) {
+                            Some(v) => v,
+                            None => {
+                                warn!("invalid TXT answer payload encoding");
+                                continue;
+                            }
+                        }
                     }
                     _ => continue,
                 };
@@ -177,4 +189,15 @@ fn flatten_txt_rdata(data: &[u8]) -> Vec<u8> {
         pos += chunk_len;
     }
     out
+}
+
+fn decode_base64_payload(encoded: &[u8]) -> Option<Vec<u8>> {
+    if encoded.is_empty() {
+        return Some(Vec::new());
+    }
+    let decoded = crate::encoding::base64::decode_bytes(encoded);
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(decoded)
 }
