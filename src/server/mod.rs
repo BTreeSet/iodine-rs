@@ -80,8 +80,21 @@ pub async fn run(args: ServerArgs) {
         std::env::var("IODINE_PASSWORD").unwrap_or_else(|_| DEFAULT_PASSWORD.to_string());
 
     let state = ServerState::new(tun_network, tun_netmask);
-    let mut tun_device = crate::tun::create_tun_device("iodine0", tun_ip, tun_netmask, 1500)
-        .expect("failed to create tun device");
+    let mut tun_device = {
+        let mut created = None;
+        for tun_name in ["iodine0", "iodine1", "iodine2"] {
+            match crate::tun::create_tun_device(tun_name, tun_ip, tun_netmask, 1500) {
+                Ok(dev) => {
+                    created = Some(dev);
+                    break;
+                }
+                Err(err) => {
+                    warn!(%tun_name, error = %err, "failed to create tun device candidate");
+                }
+            }
+        }
+        created.expect("failed to create tun device")
+    };
     let bootstrap_user = "default";
     let bootstrap_hash = [0u8; 16];
     let bootstrap_session_id = state.add_user(bootstrap_user.to_string(), bootstrap_hash);
@@ -131,6 +144,7 @@ pub async fn run(args: ServerArgs) {
                         continue;
                     }
                 };
+                let query_data_prefix = qname_data_prefix(question.qname_wire, &topdomain);
 
                 if !qname_matches_topdomain(question.qname_wire, &topdomain) {
                     warn!("dropping packet: qname outside configured topdomain");
@@ -138,8 +152,11 @@ pub async fn run(args: ServerArgs) {
                 }
 
                 if let Some(control_response) = handle_control_request(
-                    first_label,
-                    question.qtype,
+                    ControlQuery {
+                        first_label,
+                        query_data_prefix: query_data_prefix.as_deref().unwrap_or_default().as_bytes(),
+                        request_qtype: question.qtype,
+                    },
                     &state,
                     &mut handshake,
                     &password,
@@ -302,6 +319,23 @@ fn qname_to_string(qname_wire: &[u8]) -> String {
     labels.join(".")
 }
 
+fn qname_data_prefix(qname_wire: &[u8], topdomain: &str) -> Option<String> {
+    let qname = qname_to_string(qname_wire);
+    if qname.is_empty() {
+        return None;
+    }
+    let qname_lc = qname.to_ascii_lowercase();
+    if qname_lc == topdomain {
+        return Some(String::new());
+    }
+    let suffix = format!(".{topdomain}");
+    if let Some(stripped) = qname_lc.strip_suffix(&suffix) {
+        let orig_len = stripped.len();
+        return Some(qname[..orig_len].to_string());
+    }
+    None
+}
+
 fn response_rr_type(request_qtype: u16) -> u16 {
     if request_qtype == DNS_TYPE_TXT {
         DNS_TYPE_TXT
@@ -321,6 +355,12 @@ struct HandshakeState {
     pending_login_challenges: HashMap<u8, u32>,
 }
 
+struct ControlQuery<'a> {
+    first_label: &'a [u8],
+    query_data_prefix: &'a [u8],
+    request_qtype: u16,
+}
+
 impl Default for HandshakeState {
     fn default() -> Self {
         Self {
@@ -332,27 +372,26 @@ impl Default for HandshakeState {
 }
 
 fn handle_control_request(
-    first_label: &[u8],
-    request_qtype: u16,
+    query: ControlQuery<'_>,
     state: &ServerState,
     handshake: &mut HandshakeState,
     password: &str,
     tun_ip: Ipv4Addr,
     tun_netmask: Ipv4Addr,
 ) -> Option<ControlResponse> {
-    let first_char = *first_label.first()?;
-    let rr_type = response_rr_type(request_qtype);
+    let first_char = *query.first_label.first()?;
+    let rr_type = response_rr_type(query.request_qtype);
     match first_char.to_ascii_lowercase() {
         b'y' => {
-            if first_label.len() < 3 {
+            if query.first_label.len() < 3 {
                 return Some(ControlResponse {
                     rr_type,
                     payload: b"BADLEN".to_vec(),
                 });
             }
-            let requested_codec = first_label[1].to_ascii_uppercase();
+            let requested_codec = query.first_label[1].to_ascii_uppercase();
             let supports_codec = match requested_codec {
-                b'R' => request_qtype == DNS_TYPE_NULL || request_qtype == DNS_TYPE_TXT,
+                b'R' => query.request_qtype == DNS_TYPE_NULL || query.request_qtype == DNS_TYPE_TXT,
                 b'T' | b'S' | b'U' | b'V' => true,
                 _ => false,
             };
@@ -362,7 +401,7 @@ fn handle_control_request(
                     payload: b"BADCODEC".to_vec(),
                 });
             }
-            let variant = decode_base32_char(first_label[2]).unwrap_or(0);
+            let variant = decode_base32_char(query.first_label[2]).unwrap_or(0);
             if variant != 1 {
                 return Some(ControlResponse {
                     rr_type,
@@ -375,7 +414,7 @@ fn handle_control_request(
             })
         }
         b'v' => {
-            let decoded = crate::encoding::base32::decode_bytes(&first_label[1..]).ok()?;
+            let decoded = crate::encoding::base32::decode_bytes(&query.first_label[1..]).ok()?;
             if decoded.len() < 4 {
                 return Some(ControlResponse {
                     rr_type,
@@ -410,7 +449,7 @@ fn handle_control_request(
             })
         }
         b'l' => {
-            let decoded = crate::encoding::base32::decode_bytes(&first_label[1..]).ok()?;
+            let decoded = crate::encoding::base32::decode_bytes(&query.first_label[1..]).ok()?;
             if decoded.len() < 17 {
                 return Some(ControlResponse {
                     rr_type,
@@ -460,16 +499,16 @@ fn handle_control_request(
         }
         b'z' => Some(ControlResponse {
             rr_type,
-            payload: first_label.to_vec(),
+            payload: query.query_data_prefix.to_vec(),
         }),
         b's' => {
-            if first_label.len() < 3 {
+            if query.first_label.len() < 3 {
                 return Some(ControlResponse {
                     rr_type,
                     payload: b"BADLEN".to_vec(),
                 });
             }
-            let codec = decode_base32_char(first_label[2]).unwrap_or(0);
+            let codec = decode_base32_char(query.first_label[2]).unwrap_or(0);
             let payload = match codec {
                 5 => b"Base32".to_vec(),
                 6 => b"Base64".to_vec(),
@@ -480,13 +519,13 @@ fn handle_control_request(
             Some(ControlResponse { rr_type, payload })
         }
         b'o' => {
-            if first_label.len() < 3 {
+            if query.first_label.len() < 3 {
                 return Some(ControlResponse {
                     rr_type,
                     payload: b"BADLEN".to_vec(),
                 });
             }
-            let payload = match first_label[2].to_ascii_lowercase() {
+            let payload = match query.first_label[2].to_ascii_lowercase() {
                 b't' => b"Base32".to_vec(),
                 b's' => b"Base64".to_vec(),
                 b'u' => b"Base64u".to_vec(),
@@ -499,15 +538,15 @@ fn handle_control_request(
             Some(ControlResponse { rr_type, payload })
         }
         b'r' => {
-            if first_label.len() < 4 {
+            if query.first_label.len() < 4 {
                 return Some(ControlResponse {
                     rr_type,
                     payload: b"BADLEN".to_vec(),
                 });
             }
-            let c1 = decode_base32_char(first_label[1]).unwrap_or(0);
-            let c2 = decode_base32_char(first_label[2]).unwrap_or(0);
-            let c3 = decode_base32_char(first_label[3]).unwrap_or(0);
+            let c1 = decode_base32_char(query.first_label[1]).unwrap_or(0);
+            let c2 = decode_base32_char(query.first_label[2]).unwrap_or(0);
+            let c3 = decode_base32_char(query.first_label[3]).unwrap_or(0);
             let req_frag_size = (((c1 & 1) as usize) << 10) | ((c2 as usize) << 5) | (c3 as usize);
             if !(2..=2047).contains(&req_frag_size) {
                 return Some(ControlResponse {
@@ -529,7 +568,7 @@ fn handle_control_request(
             Some(ControlResponse { rr_type, payload })
         }
         b'n' => {
-            let decoded = crate::encoding::base32::decode_bytes(&first_label[1..]).ok()?;
+            let decoded = crate::encoding::base32::decode_bytes(&query.first_label[1..]).ok()?;
             if decoded.len() < 3 {
                 return Some(ControlResponse {
                     rr_type,
