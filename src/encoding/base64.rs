@@ -30,11 +30,11 @@ pub fn encode_with_limit(data: &[u8], max_output: usize) -> (String, usize) {
 }
 
 pub fn decode(input: &str) -> Vec<u8> {
-    decode_bytes(input.as_bytes())
+    decode_bytes(input.as_bytes()).unwrap_or_default()
 }
 
-pub fn decode_bytes(input: &[u8]) -> Vec<u8> {
-    IODINE_BASE64.decode(input).unwrap_or_default()
+pub fn decode_bytes(input: &[u8]) -> Result<Vec<u8>, data_encoding::DecodeError> {
+    IODINE_BASE64.decode(input)
 }
 
 #[cfg(test)]

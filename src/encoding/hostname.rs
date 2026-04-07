@@ -33,7 +33,7 @@ impl EncoderKind {
     pub fn decode(self, data: &[u8]) -> Vec<u8> {
         match self {
             Self::Base32 => base32::decode_bytes(data).unwrap_or_default(),
-            Self::Base64 => base64::decode_bytes(data),
+            Self::Base64 => base64::decode_bytes(data).unwrap_or_default(),
             Self::Base128 => base128::decode(data),
         }
     }

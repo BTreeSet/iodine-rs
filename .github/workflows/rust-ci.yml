@@ -36,3 +36,9 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Run Dockerized Interoperability Matrix
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd tests/e2e
+          ./run_matrix.sh
