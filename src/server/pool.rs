@@ -20,8 +20,8 @@ impl IpPool {
         let mut available_set = HashSet::new();
         // Ensure there is at least one assignable host address between
         // network and broadcast addresses.
-        if broadcast >= base + 2 {
-            for raw in (base + 1)..broadcast {
+        if broadcast >= base + 3 {
+            for raw in (base + 2)..broadcast {
                 let ip = Ipv4Addr::from(raw);
                 available.push_back(ip);
                 available_set.insert(ip);
@@ -73,8 +73,8 @@ mod tests {
         let second = pool.acquire();
         let third = pool.acquire();
 
-        assert_eq!(first, Some(Ipv4Addr::new(10, 0, 0, 1)));
-        assert_eq!(second, Some(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(first, Some(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(second, None);
         assert_eq!(third, None);
     }
 

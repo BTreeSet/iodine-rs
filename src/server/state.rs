@@ -6,7 +6,10 @@ use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 use bytes::Bytes;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use lru::LruCache;
+use std::io::Write;
 
 use crate::server::pool::IpPool;
 use tracing::debug;
@@ -65,6 +68,16 @@ pub struct Session {
     pub virtual_ip: Ipv4Addr,
     pub upstream_codec: Codec,
     pub downstream_queue: VecDeque<Bytes>,
+    pub upstream_seq: u8,
+    pub upstream_fragment: u8,
+    pub upstream_reassembly: Vec<u8>,
+    pub upstream_initialized: bool,
+    pub downstream_seq: u8,
+    pub downstream_fragment: u8,
+    pub downstream_sentlen: usize,
+    pub downstream_offset: usize,
+    pub downstream_current: Vec<u8>,
+    pub use_tun_pi: bool,
     pub last_active: Instant,
 }
 
@@ -138,6 +151,16 @@ impl ServerState {
             virtual_ip,
             upstream_codec: Codec::Base32,
             downstream_queue: VecDeque::new(),
+            upstream_seq: 0,
+            upstream_fragment: 0,
+            upstream_reassembly: Vec::new(),
+            upstream_initialized: false,
+            downstream_seq: 0,
+            downstream_fragment: 0,
+            downstream_sentlen: 0,
+            downstream_offset: 0,
+            downstream_current: Vec::new(),
+            use_tun_pi: false,
             last_active: Instant::now(),
         };
         let mut by_ip = self
@@ -232,6 +255,173 @@ impl ServerState {
         Ok(())
     }
 
+    pub fn set_use_tun_pi(&self, user_id: u32, enabled: bool) -> Result<(), ServerError> {
+        let mut sessions = self
+            .sessions_by_id
+            .write()
+            .expect("sessions_by_id lock poisoned during set_use_tun_pi");
+        let session = sessions
+            .get_mut(&user_id)
+            .ok_or(ServerError::SessionNotFound)?;
+        session.use_tun_pi = enabled;
+        session.last_active = Instant::now();
+        Ok(())
+    }
+
+    pub fn use_tun_pi(&self, user_id: u32) -> Result<bool, ServerError> {
+        let sessions = self
+            .sessions_by_id
+            .read()
+            .expect("sessions_by_id lock poisoned during use_tun_pi");
+        let session = sessions.get(&user_id).ok_or(ServerError::SessionNotFound)?;
+        Ok(session.use_tun_pi)
+    }
+
+    pub fn process_downstream_ack(
+        &self,
+        user_id: u32,
+        down_seq: u8,
+        down_frag: u8,
+    ) -> Result<(), ServerError> {
+        let mut sessions = self
+            .sessions_by_id
+            .write()
+            .expect("sessions_by_id lock poisoned during process_downstream_ack");
+        let session = sessions
+            .get_mut(&user_id)
+            .ok_or(ServerError::SessionNotFound)?;
+        if session.downstream_current.is_empty() {
+            return Ok(());
+        }
+        if session.downstream_seq != down_seq || session.downstream_fragment != down_frag {
+            return Ok(());
+        }
+
+        session.downstream_offset = session
+            .downstream_offset
+            .saturating_add(session.downstream_sentlen);
+        session.downstream_sentlen = 0;
+        session.downstream_fragment = session.downstream_fragment.wrapping_add(1) & 0x0f;
+
+        if session.downstream_offset >= session.downstream_current.len() {
+            session.downstream_current.clear();
+            session.downstream_offset = 0;
+        }
+        session.last_active = Instant::now();
+        Ok(())
+    }
+
+    pub fn push_upstream_fragment(
+        &self,
+        user_id: u32,
+        up_seq: u8,
+        up_frag: u8,
+        fragment: &[u8],
+        last_fragment: bool,
+    ) -> Result<Option<Vec<u8>>, ServerError> {
+        let mut sessions = self
+            .sessions_by_id
+            .write()
+            .expect("sessions_by_id lock poisoned during push_upstream_fragment");
+        let session = sessions
+            .get_mut(&user_id)
+            .ok_or(ServerError::SessionNotFound)?;
+
+        if !session.upstream_initialized {
+            session.upstream_seq = up_seq;
+            session.upstream_fragment = up_frag;
+            session.upstream_reassembly.clear();
+            session.upstream_initialized = true;
+        } else if up_seq != session.upstream_seq {
+            if recent_seqno(session.upstream_seq, up_seq) {
+                return Ok(None);
+            }
+            session.upstream_seq = up_seq;
+            session.upstream_fragment = up_frag;
+            session.upstream_reassembly.clear();
+        } else if up_frag <= session.upstream_fragment
+            && !(session.upstream_fragment == 0
+                && up_frag == 0
+                && session.upstream_reassembly.is_empty())
+        {
+            return Ok(None);
+        } else {
+            session.upstream_fragment = up_frag;
+        }
+
+        session.upstream_reassembly.extend_from_slice(fragment);
+        session.last_active = Instant::now();
+
+        if !last_fragment {
+            return Ok(None);
+        }
+
+        let packet = std::mem::take(&mut session.upstream_reassembly);
+        Ok(Some(packet))
+    }
+
+    pub fn upstream_ack(&self, user_id: u32) -> Result<(u8, u8), ServerError> {
+        let sessions = self
+            .sessions_by_id
+            .read()
+            .expect("sessions_by_id lock poisoned during upstream_ack");
+        let session = sessions.get(&user_id).ok_or(ServerError::SessionNotFound)?;
+        Ok((
+            session.upstream_seq & 0x07,
+            session.upstream_fragment & 0x0f,
+        ))
+    }
+
+    pub fn build_downstream_packet(
+        &self,
+        user_id: u32,
+        fragment_size: usize,
+        up_ack_seq: u8,
+        up_ack_frag: u8,
+    ) -> Result<Vec<u8>, ServerError> {
+        let mut sessions = self
+            .sessions_by_id
+            .write()
+            .expect("sessions_by_id lock poisoned during build_downstream_packet");
+        let session = sessions
+            .get_mut(&user_id)
+            .ok_or(ServerError::SessionNotFound)?;
+
+        if session.downstream_current.is_empty() {
+            if let Some(packet) = session.downstream_queue.pop_front() {
+                session.downstream_seq = (session.downstream_seq + 1) & 0x07;
+                session.downstream_fragment = 0;
+                session.downstream_offset = 0;
+                session.downstream_sentlen = 0;
+                session.downstream_current = compress_packet(&packet);
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut datalen = 0usize;
+        let mut last = false;
+        if !session.downstream_current.is_empty() {
+            let available = session.downstream_current.len() - session.downstream_offset;
+            datalen = fragment_size.min(available);
+            last = session.downstream_offset + datalen >= session.downstream_current.len();
+        }
+
+        out.push(0x80 | ((up_ack_seq & 0x07) << 4) | (up_ack_frag & 0x0f));
+        out.push(
+            ((session.downstream_seq & 0x07) << 5)
+                | ((session.downstream_fragment & 0x0f) << 1)
+                | u8::from(last),
+        );
+        if datalen > 0 {
+            let start = session.downstream_offset;
+            out.extend_from_slice(&session.downstream_current[start..start + datalen]);
+            session.downstream_sentlen = datalen;
+        }
+
+        session.last_active = Instant::now();
+        Ok(out)
+    }
+
     pub fn user_codec(&self, user_id: u32) -> Result<Codec, ServerError> {
         let sessions = self
             .sessions_by_id
@@ -244,6 +434,29 @@ impl ServerState {
     pub fn user_codec_or_default(&self, user_id: u32, default: Codec) -> Codec {
         self.user_codec(user_id).unwrap_or(default)
     }
+}
+
+fn compress_packet(data: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    if encoder.write_all(data).is_err() {
+        return Vec::new();
+    }
+    encoder.finish().unwrap_or_default()
+}
+
+fn recent_seqno(current: u8, candidate: u8) -> bool {
+    let candidate = (candidate & 0x07) as i8;
+    let mut seq = current as i8;
+    for _ in 0..4 {
+        if candidate == seq {
+            return true;
+        }
+        seq -= 1;
+        if seq < 0 {
+            seq = 7;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -313,7 +526,7 @@ mod tests {
             .expect("session should be created");
 
         assert_eq!(session_id, id);
-        assert_eq!(virtual_ip, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(virtual_ip, Ipv4Addr::new(10, 0, 0, 2));
     }
 
     #[test]
