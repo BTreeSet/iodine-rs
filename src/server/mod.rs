@@ -17,8 +17,10 @@
 //!   - `P<...>` acts as keepalive + downstream ACK carrier and must return a valid response packet.
 //!   - Minimal compatibility for this server is to parse + acknowledge with a valid downstream response RR.
 use clap::Args;
+use flate2::read::ZlibDecoder;
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use bytes::{Bytes, BytesMut};
@@ -44,10 +46,7 @@ const DOWNCODECCHECK1: &[u8] = b"\x00\x00\x00\x00\xFF\xFF\xFF\xFF\x55\x55\x55\x5
 \x81\x63\xC8\xD2\xC7\x7C\xB2\x17\x5F\x4F\xCE\xC9\x49\x2D\x52\x21\
 \x61\xA9\x71\x20\x25\xB3\x06\x73\xE6\xD8\x44\x30\x79\x50\x57\xBF";
 
-const PACKET_TYPE_DATA: u8 = 0x20;
-const PACKET_TYPE_LOGIN: u8 = 0x10;
-const PACKET_TYPE_PING: u8 = 0x30;
-const PACKET_TYPE_CODEC: u8 = 0x40;
+const DOWNSTREAM_FRAGMENT_SIZE: usize = 360;
 
 #[derive(Debug, Clone, Args)]
 pub struct ServerArgs {
@@ -193,104 +192,66 @@ async fn handle_udp_packet(
         return Ok(());
     }
 
-    let Some((packet_type, user_id, payload_bytes)) = parse_packet_type(first_label) else {
+    let query_prefix = qname_data_prefix(question.qname_wire, &ctx.topdomain).unwrap_or_default();
+    let Some(packet) = parse_upstream_query(query_prefix.as_bytes()) else {
         send_probe_fallback_response(socket, peer, &header, question).await?;
         return Ok(());
     };
 
-    match packet_type {
-        PACKET_TYPE_CODEC => {
-            let current_codec = state.user_codec_or_default(user_id, Codec::Base32);
-            let decoded = crate::encoding::decode_upstream(current_codec, payload_bytes)
-                .map_err(|e| ServerError::Encoding(e.to_string()))?;
-            let requested = *decoded.first().ok_or_else(|| {
-                ServerError::InvalidPacket("codec packet missing requested codec byte".to_string())
-            })?;
-            let next_codec = Codec::try_from(requested).map_err(|_| {
-                ServerError::InvalidPacket("invalid requested codec id".to_string())
-            })?;
-            state.set_user_codec(user_id, next_codec)?;
-            send_rr_response(socket, peer, &header, question, DNS_TYPE_TXT, b"OK").await?;
-        }
-        PACKET_TYPE_LOGIN => {
-            let decoded = crate::encoding::base32::decode_bytes(payload_bytes)
-                .map_err(|e| ServerError::Encoding(format!("login decode failed: {e}")))?;
-            if decoded.len() < 17 {
-                send_rr_response(
-                    socket,
-                    peer,
-                    &header,
-                    question,
-                    DNS_TYPE_TXT,
-                    CONTROL_BADLEN,
-                )
-                .await?;
-                return Ok(());
-            }
-            let handshake_userid = decoded[0];
-            let Some(seed) = handshake
-                .pending_login_challenges
-                .get(&handshake_userid)
+    match packet {
+        UpstreamQuery::Ping {
+            user_id,
+            down_seq,
+            down_frag,
+        } => {
+            let session_id = handshake
+                .session_id_by_handshake_user
+                .get(&user_id)
                 .copied()
-            else {
-                send_rr_response(socket, peer, &header, question, DNS_TYPE_TXT, b"BADIP").await?;
+                .unwrap_or(user_id);
+            let _ = state.process_downstream_ack(session_id, down_seq, down_frag);
+            send_data_response(socket, peer, &header, question, state, session_id).await?;
+        }
+        UpstreamQuery::Data {
+            user_id,
+            up_seq,
+            up_frag,
+            down_seq,
+            down_frag,
+            last_frag,
+            encoded_payload,
+        } => {
+            let session_id = handshake
+                .session_id_by_handshake_user
+                .get(&user_id)
+                .copied()
+                .unwrap_or(user_id);
+            let codec = state.user_codec_or_default(session_id, Codec::Base32);
+            let decoded = decode_upstream_payload(codec, encoded_payload)
+                .map_err(|e| ServerError::Encoding(e.to_string()))?;
+            let _ = state.process_downstream_ack(session_id, down_seq, down_frag);
+            let assembled =
+                state.push_upstream_fragment(session_id, up_seq, up_frag, &decoded, last_frag);
+            let Ok(Some(compressed_packet)) = assembled else {
+                send_data_response(socket, peer, &header, question, state, session_id).await?;
                 return Ok(());
             };
-            let expected_hash = login_hash(&ctx.password, seed);
-            if !constant_time_eq_16(&decoded[1..17], &expected_hash) {
-                send_rr_response(socket, peer, &header, question, DNS_TYPE_TXT, b"LNAK").await?;
+            let mut decoder = ZlibDecoder::new(&compressed_packet[..]);
+            let mut inflated = Vec::new();
+            decoder
+                .read_to_end(&mut inflated)
+                .map_err(|e| ServerError::InvalidPacket(format!("zlib decode failed: {e}")))?;
+            let packet = strip_tun_pi_if_present(&inflated);
+            let ip_version = packet.first().map(|b| b >> 4).unwrap_or(0);
+            if ip_version != 4 {
+                debug!(session_id, ip_version, "dropping non-ipv4 upstream packet");
+                send_data_response(socket, peer, &header, question, state, session_id).await?;
                 return Ok(());
             }
-
-            let mut supplied_hash = [0u8; 16];
-            supplied_hash.copy_from_slice(&decoded[1..17]);
-            let username = format!("user-{handshake_userid}");
-            let user_id_created = state.add_user(username.clone(), supplied_hash);
-            let (_, client_ip) = state
-                .create_session(&username, supplied_hash)
-                .map_err(|e| ServerError::InvalidPacket(format!("session create failed: {e}")))?;
-            let _ = state.set_user_codec(user_id_created, Codec::Base32);
-            handshake.pending_login_challenges.remove(&handshake_userid);
-
-            let payload = format!(
-                "{}-{}-1500-{}",
-                ctx.tun_ip,
-                client_ip,
-                ipv4_netmask_prefix(ctx.tun_netmask)
-            )
-            .into_bytes();
-            send_rr_response(
-                socket,
-                peer,
-                &header,
-                question,
-                response_rr_type(question.qtype),
-                &payload,
-            )
-            .await?;
-        }
-        PACKET_TYPE_PING => {
-            let downstream = state.pop_downstream_packet(user_id).ok().flatten();
-            send_data_response(socket, peer, &header, question, downstream).await?;
-        }
-        PACKET_TYPE_DATA => {
-            let codec = state.user_codec_or_default(user_id, Codec::Base32);
-            let decoded = crate::encoding::decode_upstream(codec, payload_bytes)
-                .map_err(|e| ServerError::Encoding(e.to_string()))?;
-            if decoded.len() < 2 {
-                send_probe_fallback_response(socket, peer, &header, question).await?;
-                return Ok(());
-            }
-            let ip_packet = &decoded[1..];
-            tun.write_all(ip_packet)
+            tun.write_all(packet)
                 .await
                 .map_err(|e| ServerError::Io(format!("tun write failed: {e}")))?;
-
-            let downstream = state.pop_downstream_packet(user_id).ok().flatten();
-            send_data_response(socket, peer, &header, question, downstream).await?;
-        }
-        _ => {
-            send_probe_fallback_response(socket, peer, &header, question).await?;
+            send_data_response(socket, peer, &header, question, state, session_id).await?;
         }
     }
 
@@ -299,6 +260,11 @@ async fn handle_udp_packet(
 
 async fn handle_tun_packet(state: &ServerState, packet: &[u8]) -> Result<(), ServerError> {
     if packet.len() < IPV4_MIN_HEADER_LEN {
+        debug!(len = packet.len(), "ignoring short tun packet");
+        return Ok(());
+    }
+    if (packet[0] >> 4) != 4 {
+        debug!(len = packet.len(), "ignoring non-ipv4 tun packet");
         return Ok(());
     }
     let dst_ip = Ipv4Addr::new(
@@ -308,7 +274,15 @@ async fn handle_tun_packet(state: &ServerState, packet: &[u8]) -> Result<(), Ser
         packet[IPV4_DST_OFFSET + 3],
     );
     if let Some(session_id) = state.find_session_id_by_virtual_ip(dst_ip) {
-        state.queue_downstream_packet(session_id, Bytes::copy_from_slice(packet))?;
+        let out_packet = if state.use_tun_pi(session_id).unwrap_or(false) {
+            let mut with_pi = Vec::with_capacity(packet.len() + 4);
+            with_pi.extend_from_slice(&[0x00, 0x00, 0x08, 0x00]);
+            with_pi.extend_from_slice(packet);
+            with_pi
+        } else {
+            packet.to_vec()
+        };
+        state.queue_downstream_packet(session_id, Bytes::from(out_packet))?;
     }
     Ok(())
 }
@@ -366,26 +340,109 @@ async fn send_data_response(
     peer: SocketAddr,
     header: &DnsHeader,
     question: DnsQuestion<'_>,
-    downstream: Option<Bytes>,
+    state: &ServerState,
+    user_id: u32,
 ) -> Result<(), ServerError> {
-    if let Some(downstream_packet) = downstream {
-        let encoded = crate::encoding::base64::encode(&downstream_packet);
-        let rr_type = if question.qtype == DNS_TYPE_TXT {
-            DNS_TYPE_TXT
-        } else {
-            DNS_TYPE_NULL
-        };
-        send_rr_response(socket, peer, header, question, rr_type, encoded.as_bytes()).await
+    let (up_ack_seq, up_ack_frag) = state.upstream_ack(user_id).unwrap_or((0, 0));
+    let payload = state
+        .build_downstream_packet(user_id, DOWNSTREAM_FRAGMENT_SIZE, up_ack_seq, up_ack_frag)
+        .unwrap_or_else(|_| vec![0x80, 0x00]);
+    if question.qtype == DNS_TYPE_TXT {
+        let encoded = crate::encoding::base32::encode(&payload);
+        let mut txt_payload = Vec::with_capacity(encoded.len() + 1);
+        txt_payload.push(b't');
+        txt_payload.extend_from_slice(encoded.as_bytes());
+        send_rr_response(socket, peer, header, question, DNS_TYPE_TXT, &txt_payload).await
     } else {
-        send_probe_fallback_response(socket, peer, header, question).await
+        send_rr_response(socket, peer, header, question, DNS_TYPE_NULL, &payload).await
     }
 }
 
-fn parse_packet_type(first_label: &[u8]) -> Option<(u8, u32, &[u8])> {
-    let (&lead, payload) = first_label.split_first()?;
-    let packet_type = lead & 0xF0;
-    let user_id = (lead & 0x0F) as u32;
-    Some((packet_type, user_id, payload))
+#[derive(Debug)]
+enum UpstreamQuery<'a> {
+    Ping {
+        user_id: u32,
+        down_seq: u8,
+        down_frag: u8,
+    },
+    Data {
+        user_id: u32,
+        up_seq: u8,
+        up_frag: u8,
+        down_seq: u8,
+        down_frag: u8,
+        last_frag: bool,
+        encoded_payload: &'a [u8],
+    },
+}
+
+fn parse_upstream_query(data: &[u8]) -> Option<UpstreamQuery<'_>> {
+    let (&first, rest) = data.split_first()?;
+    if first.eq_ignore_ascii_case(&b'p') {
+        let decoded = decode_upstream_payload(Codec::Base32, rest).ok()?;
+        if decoded.len() < 2 {
+            return None;
+        }
+        let user_id = decoded[0] as u32;
+        let down_seq = (decoded[1] >> 4) & 0x07;
+        let down_frag = decoded[1] & 0x0f;
+        return Some(UpstreamQuery::Ping {
+            user_id,
+            down_seq,
+            down_frag,
+        });
+    }
+    let user_id = hex_nibble(first)? as u32;
+    if data.len() < 6 {
+        return None;
+    }
+    let c1 = crate::encoding::base32::b32_8to5(data[1]);
+    let c2 = crate::encoding::base32::b32_8to5(data[2]);
+    let c3 = crate::encoding::base32::b32_8to5(data[3]);
+    let up_seq = (c1 >> 2) & 0x07;
+    let up_frag = ((c1 & 0x03) << 2) | ((c2 >> 3) & 0x03);
+    let down_seq = c2 & 0x07;
+    let down_frag = (c3 >> 1) & 0x0f;
+    let last_frag = (c3 & 0x01) != 0;
+    Some(UpstreamQuery::Data {
+        user_id,
+        up_seq,
+        up_frag,
+        down_seq,
+        down_frag,
+        last_frag,
+        encoded_payload: &data[5..],
+    })
+}
+
+fn decode_upstream_payload(
+    codec: Codec,
+    payload: &[u8],
+) -> Result<Vec<u8>, crate::encoding::EncodingError> {
+    let undotified: Vec<u8> = payload.iter().copied().filter(|b| *b != b'.').collect();
+    crate::encoding::decode_upstream(codec, &undotified)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn strip_tun_pi_if_present(packet: &[u8]) -> &[u8] {
+    if packet.len() >= 5
+        && packet[0] == 0x00
+        && packet[1] == 0x00
+        && ((packet[2] == 0x08 && packet[3] == 0x00) || (packet[2] == 0x86 && packet[3] == 0xdd))
+        && ((packet[4] >> 4) == 4 || (packet[4] >> 4) == 6)
+    {
+        &packet[4..]
+    } else {
+        packet
+    }
 }
 
 fn first_label_bytes(qname_wire: &[u8]) -> Option<&[u8]> {
@@ -465,6 +522,7 @@ struct HandshakeState {
     next_handshake_userid: u8,
     login_challenge_seed: u32,
     pending_login_challenges: HashMap<u8, u32>,
+    session_id_by_handshake_user: HashMap<u32, u32>,
 }
 
 struct ControlQuery<'a> {
@@ -479,6 +537,7 @@ impl Default for HandshakeState {
             next_handshake_userid: 1,
             login_challenge_seed: 0x0102_0304,
             pending_login_challenges: HashMap::new(),
+            session_id_by_handshake_user: HashMap::new(),
         }
     }
 }
@@ -536,8 +595,7 @@ fn handle_control_request(
             let version = u32::from_be_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]);
             if version == PROTOCOL_VERSION {
                 let userid = handshake.next_handshake_userid;
-                handshake.next_handshake_userid =
-                    handshake.next_handshake_userid.wrapping_add(1).max(1);
+                handshake.next_handshake_userid = if userid >= 15 { 1 } else { userid + 1 };
                 let seed = handshake.login_challenge_seed;
                 handshake.login_challenge_seed =
                     handshake.login_challenge_seed.wrapping_add(0x1021);
@@ -598,6 +656,9 @@ fn handle_control_request(
                 }
             };
             let _ = state.set_user_codec(created_id, Codec::Base32);
+            handshake
+                .session_id_by_handshake_user
+                .insert(userid as u32, created_id);
             handshake.pending_login_challenges.remove(&userid);
             let payload = format!(
                 "{}-{}-1500-{}",
@@ -608,10 +669,6 @@ fn handle_control_request(
             .into_bytes();
             Some(ControlResponse { rr_type, payload })
         }
-        b'p' => Some(ControlResponse {
-            rr_type,
-            payload: vec![0, 0],
-        }),
         b'i' => {
             let mut payload = Vec::with_capacity(5);
             payload.push(b'I');
@@ -629,12 +686,33 @@ fn handle_control_request(
                     payload: CONTROL_BADLEN.to_vec(),
                 });
             }
-            let codec = decode_base32_char(query.first_label[2]).unwrap_or(0);
-            let payload = match codec {
-                5 => b"Base32".to_vec(),
-                6 => b"Base64".to_vec(),
-                26 => b"Base64u".to_vec(),
-                7 => b"Base128".to_vec(),
+            let handshake_user = decode_base32_char(query.first_label[1]).unwrap_or(0) as u32;
+            let session_id = handshake
+                .session_id_by_handshake_user
+                .get(&handshake_user)
+                .copied()
+                .unwrap_or(handshake_user);
+            let codec_id = decode_base32_char(query.first_label[2]).unwrap_or(0);
+            let payload = match codec_id {
+                5 => {
+                    let _ = state.set_user_codec(session_id, Codec::Base32);
+                    b"Base32".to_vec()
+                }
+                6 => {
+                    let _ = state.set_user_codec(session_id, Codec::Base64);
+                    let _ = state.set_use_tun_pi(session_id, true);
+                    b"Base64".to_vec()
+                }
+                26 => {
+                    let _ = state.set_user_codec(session_id, Codec::Base64u);
+                    let _ = state.set_use_tun_pi(session_id, true);
+                    b"Base64u".to_vec()
+                }
+                7 => {
+                    let _ = state.set_user_codec(session_id, Codec::Base128);
+                    let _ = state.set_use_tun_pi(session_id, true);
+                    b"Base128".to_vec()
+                }
                 _ => b"BADCODEC".to_vec(),
             };
             Some(ControlResponse { rr_type, payload })
@@ -754,7 +832,7 @@ fn ipv4_netmask_prefix(mask: Ipv4Addr) -> u8 {
 mod tests {
     use std::net::Ipv4Addr;
 
-    use super::{ipv4_netmask_prefix, login_hash, parse_packet_type};
+    use super::{hex_nibble, ipv4_netmask_prefix, login_hash, parse_upstream_query, UpstreamQuery};
 
     fn to_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -774,11 +852,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_packet_type_uses_high_nibble_command_mask() {
-        let data = [0x43, 0x99, 0x88];
-        let (ptype, uid, payload) = parse_packet_type(&data).expect("parsed");
-        assert_eq!(ptype, 0x40);
-        assert_eq!(uid, 0x03);
-        assert_eq!(payload, &[0x99, 0x88]);
+    fn parse_upstream_data_query_uses_c_header_layout() {
+        let data = b"1abczhello";
+        let parsed = parse_upstream_query(data).expect("parsed");
+        match parsed {
+            UpstreamQuery::Data {
+                user_id,
+                up_seq,
+                up_frag,
+                down_seq,
+                down_frag,
+                last_frag,
+                encoded_payload,
+            } => {
+                assert_eq!(user_id, 1);
+                assert_eq!(up_seq, 0);
+                assert_eq!(up_frag, 0);
+                assert_eq!(down_seq, 1);
+                assert_eq!(down_frag, 1);
+                assert!(!last_frag);
+                assert_eq!(encoded_payload, b"hello");
+            }
+            _ => panic!("expected data query"),
+        }
+    }
+
+    #[test]
+    fn hex_nibble_accepts_lower_upper_and_digits() {
+        assert_eq!(hex_nibble(b'0'), Some(0));
+        assert_eq!(hex_nibble(b'9'), Some(9));
+        assert_eq!(hex_nibble(b'a'), Some(10));
+        assert_eq!(hex_nibble(b'F'), Some(15));
+        assert_eq!(hex_nibble(b'x'), None);
     }
 }
