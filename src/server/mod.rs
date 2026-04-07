@@ -42,6 +42,7 @@ const PROTOCOL_VERSION: u32 = 0x0000_0502;
 const DNS_FLAGS_RESPONSE_RA: u16 = 0x8000 | 0x0080;
 const DNS_FLAGS_CLEAR_AA_MASK: u16 = !0x0200;
 const CONTROL_BADLEN: &[u8] = b"BADLEN";
+const MAX_HANDSHAKE_USERID: u8 = 15;
 const DOWNCODECCHECK1: &[u8] = b"\x00\x00\x00\x00\xFF\xFF\xFF\xFF\x55\x55\x55\x55\xAA\xAA\xAA\xAA\
 \x81\x63\xC8\xD2\xC7\x7C\xB2\x17\x5F\x4F\xCE\xC9\x49\x2D\x52\x21\
 \x61\xA9\x71\x20\x25\xB3\x06\x73\xE6\xD8\x44\x30\x79\x50\x57\xBF";
@@ -436,6 +437,7 @@ fn strip_tun_pi_if_present(packet: &[u8]) -> &[u8] {
     if packet.len() >= 5
         && packet[0] == 0x00
         && packet[1] == 0x00
+        // EtherType values in TUN_PI: 0x0800 (IPv4), 0x86DD (IPv6).
         && ((packet[2] == 0x08 && packet[3] == 0x00) || (packet[2] == 0x86 && packet[3] == 0xdd))
         && ((packet[4] >> 4) == 4 || (packet[4] >> 4) == 6)
     {
@@ -595,7 +597,11 @@ fn handle_control_request(
             let version = u32::from_be_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]);
             if version == PROTOCOL_VERSION {
                 let userid = handshake.next_handshake_userid;
-                handshake.next_handshake_userid = if userid >= 15 { 1 } else { userid + 1 };
+                handshake.next_handshake_userid = if userid >= MAX_HANDSHAKE_USERID {
+                    1
+                } else {
+                    userid + 1
+                };
                 let seed = handshake.login_challenge_seed;
                 handshake.login_challenge_seed =
                     handshake.login_challenge_seed.wrapping_add(0x1021);

@@ -2,11 +2,11 @@
 
 This document is derived from:
 
-- `/home/runner/work/iodine-rs/iodine-rs/upstream/src/common.h`
-- `/home/runner/work/iodine-rs/iodine-rs/upstream/src/encoding.c`
-- `/home/runner/work/iodine-rs/iodine-rs/upstream/src/client.c`
-- `/home/runner/work/iodine-rs/iodine-rs/upstream/src/iodined.c`
-- `/home/runner/work/iodine-rs/iodine-rs/upstream/src/dns.c`
+- `upstream/src/common.h`
+- `upstream/src/encoding.c`
+- `upstream/src/client.c`
+- `upstream/src/iodined.c`
+- `upstream/src/dns.c`
 
 ## 1) DNS upstream DATA query layout (client -> server)
 

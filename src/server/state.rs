@@ -306,7 +306,6 @@ impl ServerState {
         if session.downstream_offset >= session.downstream_current.len() {
             session.downstream_current.clear();
             session.downstream_offset = 0;
-            session.downstream_fragment = session.downstream_fragment.wrapping_sub(1) & 0x0f;
         }
         session.last_active = Instant::now();
         Ok(())
@@ -419,12 +418,6 @@ impl ServerState {
             session.downstream_sentlen = datalen;
         }
 
-        if datalen > 0 && datalen == session.downstream_current.len() {
-            session.downstream_current.clear();
-            session.downstream_offset = 0;
-            session.downstream_sentlen = 0;
-            session.downstream_fragment = 0;
-        }
         session.last_active = Instant::now();
         Ok(out)
     }
@@ -452,9 +445,10 @@ fn compress_packet(data: &[u8]) -> Vec<u8> {
 }
 
 fn recent_seqno(current: u8, candidate: u8) -> bool {
+    let candidate = (candidate & 0x07) as i8;
     let mut seq = current as i8;
     for _ in 0..4 {
-        if candidate as i8 == seq {
+        if candidate == seq {
             return true;
         }
         seq -= 1;
