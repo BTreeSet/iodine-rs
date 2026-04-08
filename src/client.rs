@@ -26,6 +26,7 @@ use tracing::{debug, warn};
 use crate::dns::{
     DnsHeader, DnsQuestion, DnsRdata, DnsResourceRecord, DNS_CLASS_IN, DNS_TYPE_NULL,
 };
+use crate::encoding::framing::{DownstreamHeader, UpstreamHeader};
 
 #[derive(Debug, Clone, Args)]
 pub struct ClientArgs {
@@ -194,15 +195,17 @@ async fn handle_tun_read(tun_packet: &[u8], state: &mut ClientState, socket: &Ud
         );
         state.session.next_cmc = (state.session.next_cmc + 1) % 36;
         let encoded_chunk = crate::encoding::base32::encode(chunk);
-        let qname = format!(
-            "{header}{}.{}",
-            crate::encoding::inline_dotify(&encoded_chunk),
-            state.topdomain
-        );
-        if send_query(
+        let dotified = crate::encoding::inline_dotify_bytes(encoded_chunk.as_bytes());
+        let mut first_label = BytesMut::with_capacity(header.len() + dotified.len());
+        first_label.extend_from_slice(&header);
+        first_label.extend_from_slice(&dotified);
+        let Some(qname_wire) = build_qname_wire_bytes(&first_label, &state.topdomain) else {
+            break;
+        };
+        if send_query_wire(
             socket,
             state.nameserver,
-            &qname,
+            &qname_wire,
             DNS_TYPE_NULL,
             &mut state.dns_id,
         )
@@ -273,31 +276,24 @@ async fn handle_udp_read(
         _ => return,
     };
     debug!(decoded_payload_len = payload.len(), "downstream rr decoded");
-    if payload.len() < 2 {
+    let Some((header, fragment)) = DownstreamHeader::parse_payload(&payload) else {
         return;
-    }
-
-    let up_ack_seq = (payload[0] >> 4) & 0x07;
-    let up_ack_frag = payload[0] & 0x0f;
-    let down_seq = (payload[1] >> 5) & 0x07;
-    let down_frag = (payload[1] >> 1) & 0x0f;
-    let last_frag = (payload[1] & 0x01) != 0;
-    state.session.down_ack_seq = down_seq;
-    state.session.down_ack_frag = down_frag;
-    let fragment = &payload[2..];
+    };
+    state.session.down_ack_seq = header.down_seq;
+    state.session.down_ack_frag = header.down_frag;
     debug!(
-        up_ack_seq,
-        up_ack_frag,
-        down_seq,
-        down_frag,
-        last_frag,
+        up_ack_seq = header.up_ack_seq,
+        up_ack_frag = header.up_ack_frag,
+        down_seq = header.down_seq,
+        down_frag = header.down_frag,
+        last_frag = header.last_frag,
         frag_len = fragment.len(),
         "downstream fragment header"
     );
 
     if let Some(packet) = state
         .downstream
-        .push_fragment(down_seq, down_frag, fragment, last_frag)
+        .push_fragment(header.down_seq, header.down_frag, fragment, header.last_frag)
     {
         let ip_packet = if state.session.mode == ClientMode::CCompat {
             strip_tun_header(&packet)
@@ -334,27 +330,42 @@ async fn handle_ping_tick(state: &mut ClientState, socket: &UdpSocket) {
 }
 
 fn build_qname_wire(first_label: &str, topdomain: &str) -> Option<Vec<u8>> {
-    if first_label.is_empty() {
-        return None;
+    build_qname_wire_bytes(first_label.as_bytes(), topdomain)
+}
+
+fn trim_ascii_dots(mut input: &[u8]) -> &[u8] {
+    while input.first() == Some(&b'.') {
+        input = &input[1..];
     }
-    let mut out = Vec::with_capacity(first_label.len() + topdomain.len() + 4);
-    for part in first_label.split('.') {
+    while input.last() == Some(&b'.') {
+        input = &input[..input.len() - 1];
+    }
+    input
+}
+
+fn append_qname_parts(out: &mut Vec<u8>, dotted: &[u8]) -> Option<()> {
+    if dotted.is_empty() {
+        return Some(());
+    }
+    for part in dotted.split(|b| *b == b'.') {
         if part.is_empty() || part.len() > 63 {
             return None;
         }
         out.push(part.len() as u8);
-        out.extend_from_slice(part.as_bytes());
+        out.extend_from_slice(part);
     }
-    let td = topdomain.trim_matches('.');
-    if !td.is_empty() {
-        for part in td.split('.') {
-            if part.is_empty() || part.len() > 63 {
-                return None;
-            }
-            out.push(part.len() as u8);
-            out.extend_from_slice(part.as_bytes());
-        }
+    Some(())
+}
+
+fn build_qname_wire_bytes(first_label: &[u8], topdomain: &str) -> Option<Vec<u8>> {
+    let first_label = trim_ascii_dots(first_label);
+    if first_label.is_empty() {
+        return None;
     }
+    let td = trim_ascii_dots(topdomain.as_bytes());
+    let mut out = Vec::with_capacity(first_label.len() + td.len() + 4);
+    append_qname_parts(&mut out, first_label)?;
+    append_qname_parts(&mut out, td)?;
     out.push(0);
     Some(out)
 }
@@ -573,6 +584,16 @@ async fn send_query(
 ) -> Result<(), ClientError> {
     let qname_wire = build_qname_wire(qname, "")
         .ok_or_else(|| ClientError::Protocol("invalid qname".to_string()))?;
+    send_query_wire(socket, nameserver, &qname_wire, qtype, dns_id).await
+}
+
+async fn send_query_wire(
+    socket: &UdpSocket,
+    nameserver: SocketAddr,
+    qname_wire: &[u8],
+    qtype: u16,
+    dns_id: &mut u16,
+) -> Result<(), ClientError> {
     let mut query = BytesMut::with_capacity(2048);
     DnsHeader {
         id: *dns_id,
@@ -584,7 +605,7 @@ async fn send_query(
     }
     .write_to(&mut query);
     DnsQuestion {
-        qname_wire: &qname_wire,
+        qname_wire,
         qtype,
         qclass: DNS_CLASS_IN,
     }
@@ -638,13 +659,17 @@ fn build_upstream_header(
     down_frag: u8,
     is_last: bool,
     cmc: usize,
-) -> String {
+) -> [u8; 5] {
     const CMC: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let c1 = crate::encoding::base32::b32_5to8(((up_seq & 0x07) << 2) | ((up_frag & 0x0f) >> 2));
-    let c2 = crate::encoding::base32::b32_5to8(((up_frag & 0x03) << 3) | (down_seq & 0x07));
-    let c3 = crate::encoding::base32::b32_5to8(((down_frag & 0x0f) << 1) | u8::from(is_last));
-    let c4 = CMC[cmc % CMC.len()];
-    String::from_utf8(vec![userid_char, c1, c2, c3, c4]).expect("header is ascii")
+    let packed = UpstreamHeader {
+        up_seq,
+        up_frag,
+        down_seq,
+        down_frag,
+        last_frag: is_last,
+    }
+    .encode_chars();
+    [userid_char, packed[0], packed[1], packed[2], CMC[cmc % CMC.len()]]
 }
 
 fn compress_zlib(data: &[u8]) -> Option<Vec<u8>> {

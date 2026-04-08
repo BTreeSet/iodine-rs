@@ -35,6 +35,7 @@ use state::{Codec, ServerError, ServerState};
 use crate::dns::{
     DnsHeader, DnsQuestion, DnsRdata, DnsResourceRecord, DNS_CLASS_IN, DNS_TYPE_NULL, DNS_TYPE_TXT,
 };
+use crate::encoding::framing::UpstreamHeader;
 
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV4_DST_OFFSET: usize = 16;
@@ -102,7 +103,7 @@ pub async fn run(args: ServerArgs) {
     let mut tun_buf = [0u8; 2048];
     let mut handshake = HandshakeState::default();
     let udp_ctx = UdpContext {
-        topdomain: topdomain.clone(),
+        topdomain_labels: split_topdomain_labels(&topdomain),
         password,
         tun_ip,
         tun_netmask,
@@ -158,9 +159,10 @@ async fn handle_udp_packet(
     let question = DnsQuestion::parse(&mut cur)
         .map_err(|e| ServerError::InvalidPacket(format!("invalid dns question: {e}")))?;
 
-    if !qname_matches_topdomain(question.qname_wire, &ctx.topdomain) {
+    if !qname_matches_topdomain(question.qname_wire, &ctx.topdomain_labels) {
         return Ok(());
     }
+    let query_prefix = qname_data_prefix(question.qname_wire, &ctx.topdomain_labels).unwrap_or_default();
 
     let first_label = first_label_bytes(question.qname_wire).ok_or_else(|| {
         ServerError::InvalidPacket("dns question missing first label".to_string())
@@ -169,10 +171,7 @@ async fn handle_udp_packet(
     if let Some(control_response) = handle_control_request(
         ControlQuery {
             first_label,
-            query_data_prefix: qname_data_prefix(question.qname_wire, &ctx.topdomain)
-                .as_deref()
-                .unwrap_or_default()
-                .as_bytes(),
+            query_data_prefix: &query_prefix,
             request_qtype: question.qtype,
         },
         state,
@@ -193,8 +192,7 @@ async fn handle_udp_packet(
         return Ok(());
     }
 
-    let query_prefix = qname_data_prefix(question.qname_wire, &ctx.topdomain).unwrap_or_default();
-    let Some(packet) = parse_upstream_query(query_prefix.as_bytes()) else {
+    let Some(packet) = parse_upstream_query(&query_prefix) else {
         send_probe_fallback_response(socket, peer, &header, question).await?;
         return Ok(());
     };
@@ -385,8 +383,7 @@ fn parse_upstream_query(data: &[u8]) -> Option<UpstreamQuery<'_>> {
             return None;
         }
         let user_id = decoded[0] as u32;
-        let down_seq = (decoded[1] >> 4) & 0x07;
-        let down_frag = decoded[1] & 0x0f;
+        let (down_seq, down_frag) = UpstreamHeader::parse_ack_byte(decoded[1]);
         return Some(UpstreamQuery::Ping {
             user_id,
             down_seq,
@@ -397,21 +394,14 @@ fn parse_upstream_query(data: &[u8]) -> Option<UpstreamQuery<'_>> {
     if data.len() < 6 {
         return None;
     }
-    let c1 = crate::encoding::base32::b32_8to5(data[1]);
-    let c2 = crate::encoding::base32::b32_8to5(data[2]);
-    let c3 = crate::encoding::base32::b32_8to5(data[3]);
-    let up_seq = (c1 >> 2) & 0x07;
-    let up_frag = ((c1 & 0x03) << 2) | ((c2 >> 3) & 0x03);
-    let down_seq = c2 & 0x07;
-    let down_frag = (c3 >> 1) & 0x0f;
-    let last_frag = (c3 & 0x01) != 0;
+    let packed = UpstreamHeader::parse_encoded([data[1], data[2], data[3]]);
     Some(UpstreamQuery::Data {
         user_id,
-        up_seq,
-        up_frag,
-        down_seq,
-        down_frag,
-        last_frag,
+        up_seq: packed.up_seq,
+        up_frag: packed.up_frag,
+        down_seq: packed.down_seq,
+        down_frag: packed.down_frag,
+        last_frag: packed.last_frag,
         encoded_payload: &data[5..],
     })
 }
@@ -419,8 +409,9 @@ fn parse_upstream_query(data: &[u8]) -> Option<UpstreamQuery<'_>> {
 fn decode_upstream_payload(
     codec: Codec,
     payload: &[u8],
-) -> Result<Vec<u8>, crate::encoding::EncodingError> {
-    let undotified: Vec<u8> = payload.iter().copied().filter(|b| *b != b'.').collect();
+) -> Result<Bytes, crate::encoding::EncodingError> {
+    let mut undotified = BytesMut::with_capacity(payload.len());
+    undotified.extend(payload.iter().copied().filter(|b| *b != b'.'));
     crate::encoding::decode_upstream(codec, &undotified)
 }
 
@@ -455,48 +446,69 @@ fn first_label_bytes(qname_wire: &[u8]) -> Option<&[u8]> {
     Some(&qname_wire[1..=len])
 }
 
-fn qname_matches_topdomain(qname_wire: &[u8], topdomain: &str) -> bool {
-    let qname = qname_to_string(qname_wire);
-    if qname.is_empty() {
-        return false;
-    }
-    let qname = qname.to_ascii_lowercase();
-    qname == topdomain || qname.ends_with(&format!(".{topdomain}"))
-}
-
-fn qname_to_string(qname_wire: &[u8]) -> String {
+fn parse_qname_labels<'a>(qname_wire: &'a [u8]) -> Option<Vec<&'a [u8]>> {
     let mut labels = Vec::new();
     let mut pos = 0usize;
-    while pos < qname_wire.len() {
-        let len = qname_wire[pos] as usize;
+    loop {
+        let len = *qname_wire.get(pos)? as usize;
         pos += 1;
         if len == 0 {
-            break;
+            return Some(labels);
         }
-        if pos + len > qname_wire.len() {
-            break;
+        if len > 63 || pos + len > qname_wire.len() {
+            return None;
         }
-        labels.push(String::from_utf8_lossy(&qname_wire[pos..pos + len]).to_string());
+        labels.push(&qname_wire[pos..pos + len]);
         pos += len;
     }
-    labels.join(".")
 }
 
-fn qname_data_prefix(qname_wire: &[u8], topdomain: &str) -> Option<String> {
-    let qname = qname_to_string(qname_wire);
-    if qname.is_empty() {
+fn split_topdomain_labels(topdomain: &str) -> Vec<Vec<u8>> {
+    topdomain
+        .split('.')
+        .filter(|label| !label.is_empty())
+        .map(|label| label.as_bytes().to_vec())
+        .collect()
+}
+
+fn qname_matches_topdomain(qname_wire: &[u8], topdomain_labels: &[Vec<u8>]) -> bool {
+    let Some(labels) = parse_qname_labels(qname_wire) else {
+        return false;
+    };
+    labels.len() >= topdomain_labels.len()
+        && labels[labels.len() - topdomain_labels.len()..]
+            .iter()
+            .zip(topdomain_labels)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn qname_data_prefix(qname_wire: &[u8], topdomain_labels: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let labels = parse_qname_labels(qname_wire)?;
+    if labels.len() < topdomain_labels.len() {
         return None;
     }
-    let qname_lc = qname.to_ascii_lowercase();
-    if qname_lc == topdomain {
-        return Some(String::new());
+    let suffix = &labels[labels.len() - topdomain_labels.len()..];
+    if !suffix
+        .iter()
+        .zip(topdomain_labels)
+        .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    {
+        return None;
     }
-    let suffix = format!(".{topdomain}");
-    if let Some(stripped) = qname_lc.strip_suffix(&suffix) {
-        let orig_len = stripped.len();
-        return Some(qname[..orig_len].to_string());
+    let prefix_count = labels.len() - topdomain_labels.len();
+    if prefix_count == 0 {
+        return Some(Vec::new());
     }
-    None
+    let total_len: usize =
+        labels[..prefix_count].iter().map(|label| label.len()).sum::<usize>() + (prefix_count - 1);
+    let mut prefix = Vec::with_capacity(total_len);
+    for (idx, label) in labels[..prefix_count].iter().enumerate() {
+        if idx > 0 {
+            prefix.push(b'.');
+        }
+        prefix.extend_from_slice(label);
+    }
+    Some(prefix)
 }
 
 fn response_rr_type(request_qtype: u16) -> u16 {
@@ -514,7 +526,7 @@ struct ControlResponse {
 
 #[derive(Clone)]
 struct UdpContext {
-    topdomain: String,
+    topdomain_labels: Vec<Vec<u8>>,
     password: String,
     tun_ip: Ipv4Addr,
     tun_netmask: Ipv4Addr,
