@@ -4,6 +4,7 @@ pub mod dns;
 pub mod encoding;
 pub mod fw_query;
 pub mod login;
+pub mod protocol;
 pub mod server;
 pub mod tun;
 pub mod user;

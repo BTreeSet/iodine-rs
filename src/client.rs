@@ -26,6 +26,11 @@ use tracing::{debug, warn};
 use crate::dns::{
     DnsHeader, DnsQuestion, DnsRdata, DnsResourceRecord, DNS_CLASS_IN, DNS_TYPE_NULL,
 };
+use crate::encoding::framing::{DownstreamHeader, UpstreamHeader};
+use crate::protocol::{
+    DNS_PACKET_BUFFER_SIZE, PACKET_PREFIX_LNAK, PACKET_PREFIX_VACK, PACKET_TYPE_LOGIN,
+    PACKET_TYPE_PING, PACKET_TYPE_VERSION, PROTOCOL_VERSION,
+};
 
 #[derive(Debug, Clone, Args)]
 pub struct ClientArgs {
@@ -78,8 +83,8 @@ pub async fn run(args: ClientArgs) {
         .password
         .expect("tunnel password must be provided via --password or IODINE_PASSWORD");
 
-    let mut tun_buf = [0u8; 2048];
-    let mut udp_buf = [0u8; 2048];
+    let mut tun_buf = [0u8; DNS_PACKET_BUFFER_SIZE];
+    let mut udp_buf = [0u8; DNS_PACKET_BUFFER_SIZE];
     let mut state = ClientState {
         topdomain,
         nameserver,
@@ -111,7 +116,8 @@ pub async fn run(args: ClientArgs) {
                         handle_tun_read(&tun_buf[..len], &mut state, &socket).await;
                     }
                     Err(err) => {
-                        warn!(error = %err, "tun read failed");
+                        let typed_err = ClientError::TunError(err);
+                        warn!(error = %typed_err);
                     }
                 }
             }
@@ -194,15 +200,21 @@ async fn handle_tun_read(tun_packet: &[u8], state: &mut ClientState, socket: &Ud
         );
         state.session.next_cmc = (state.session.next_cmc + 1) % 36;
         let encoded_chunk = crate::encoding::base32::encode(chunk);
-        let qname = format!(
-            "{header}{}.{}",
-            crate::encoding::inline_dotify(&encoded_chunk),
-            state.topdomain
-        );
-        if send_query(
+        let dotified = crate::encoding::inline_dotify_bytes(encoded_chunk.as_bytes());
+        let mut query_prefix = BytesMut::with_capacity(header.len() + dotified.len());
+        query_prefix.extend_from_slice(&header);
+        query_prefix.extend_from_slice(&dotified);
+        let Some(qname_wire) = build_qname_wire_bytes(&query_prefix, &state.topdomain) else {
+            warn!(
+                session_user = state.session.userid,
+                seq, frag, "failed to build upstream qname wire"
+            );
+            break;
+        };
+        if send_query_wire(
             socket,
             state.nameserver,
-            &qname,
+            &qname_wire,
             DNS_TYPE_NULL,
             &mut state.dns_id,
         )
@@ -247,58 +259,35 @@ async fn handle_udp_read(
         }
     };
     let payload = match rr.rdata {
-        DnsRdata::Null(data) => {
-            debug!(
-                rr_type = "NULL",
-                raw_payload_len = data.len(),
-                "downstream rr payload"
-            );
-            data.to_vec()
-        }
-        DnsRdata::Txt(data) => {
-            let txt = flatten_txt_rdata(data);
-            debug!(
-                rr_type = "TXT",
-                raw_payload_len = txt.len(),
-                "downstream rr payload"
-            );
-            match decode_downstream_txt_payload(&txt) {
-                Some(v) => v,
-                None => {
-                    warn!("invalid TXT answer payload encoding");
-                    return;
-                }
-            }
-        }
+        DnsRdata::Null(data) => handle_null_record(data),
+        DnsRdata::Txt(data) => match handle_txt_record(data) {
+            Some(payload) => payload,
+            None => return,
+        },
         _ => return,
     };
     debug!(decoded_payload_len = payload.len(), "downstream rr decoded");
-    if payload.len() < 2 {
+    let Some((header, fragment)) = DownstreamHeader::parse_payload(&payload) else {
         return;
-    }
-
-    let up_ack_seq = (payload[0] >> 4) & 0x07;
-    let up_ack_frag = payload[0] & 0x0f;
-    let down_seq = (payload[1] >> 5) & 0x07;
-    let down_frag = (payload[1] >> 1) & 0x0f;
-    let last_frag = (payload[1] & 0x01) != 0;
-    state.session.down_ack_seq = down_seq;
-    state.session.down_ack_frag = down_frag;
-    let fragment = &payload[2..];
+    };
+    state.session.down_ack_seq = header.down_seq;
+    state.session.down_ack_frag = header.down_frag;
     debug!(
-        up_ack_seq,
-        up_ack_frag,
-        down_seq,
-        down_frag,
-        last_frag,
+        up_ack_seq = header.up_ack_seq,
+        up_ack_frag = header.up_ack_frag,
+        down_seq = header.down_seq,
+        down_frag = header.down_frag,
+        last_frag = header.last_frag,
         frag_len = fragment.len(),
         "downstream fragment header"
     );
 
-    if let Some(packet) = state
-        .downstream
-        .push_fragment(down_seq, down_frag, fragment, last_frag)
-    {
+    if let Some(packet) = state.downstream.push_fragment(
+        header.down_seq,
+        header.down_frag,
+        fragment,
+        header.last_frag,
+    ) {
         let ip_packet = if state.session.mode == ClientMode::CCompat {
             strip_tun_header(&packet)
         } else {
@@ -334,27 +323,44 @@ async fn handle_ping_tick(state: &mut ClientState, socket: &UdpSocket) {
 }
 
 fn build_qname_wire(first_label: &str, topdomain: &str) -> Option<Vec<u8>> {
-    if first_label.is_empty() {
-        return None;
+    build_qname_wire_bytes(first_label.as_bytes(), topdomain)
+}
+
+/// Trims leading and trailing ASCII dots from a byte slice.
+fn trim_ascii_dots(mut input: &[u8]) -> &[u8] {
+    let start = input.iter().position(|&b| b != b'.').unwrap_or(input.len());
+    input = &input[start..];
+    let end = input
+        .iter()
+        .rposition(|&b| b != b'.')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    &input[..end]
+}
+
+fn append_qname_parts(out: &mut Vec<u8>, dotted: &[u8]) -> Option<()> {
+    if dotted.is_empty() {
+        return Some(());
     }
-    let mut out = Vec::with_capacity(first_label.len() + topdomain.len() + 4);
-    for part in first_label.split('.') {
+    for part in dotted.split(|b| *b == b'.') {
         if part.is_empty() || part.len() > 63 {
             return None;
         }
         out.push(part.len() as u8);
-        out.extend_from_slice(part.as_bytes());
+        out.extend_from_slice(part);
     }
-    let td = topdomain.trim_matches('.');
-    if !td.is_empty() {
-        for part in td.split('.') {
-            if part.is_empty() || part.len() > 63 {
-                return None;
-            }
-            out.push(part.len() as u8);
-            out.extend_from_slice(part.as_bytes());
-        }
+    Some(())
+}
+
+fn build_qname_wire_bytes(first_label: &[u8], topdomain: &str) -> Option<Vec<u8>> {
+    let first_label = trim_ascii_dots(first_label);
+    if first_label.is_empty() {
+        return None;
     }
+    let td = trim_ascii_dots(topdomain.as_bytes());
+    let mut out = Vec::with_capacity(first_label.len() + td.len() + 4);
+    append_qname_parts(&mut out, first_label)?;
+    append_qname_parts(&mut out, td)?;
     out.push(0);
     Some(out)
 }
@@ -372,6 +378,33 @@ fn flatten_txt_rdata(data: &[u8]) -> Vec<u8> {
         pos += chunk_len;
     }
     out
+}
+
+fn handle_null_record(data: &[u8]) -> Vec<u8> {
+    debug!(
+        rr_type = "NULL",
+        raw_payload_len = data.len(),
+        "downstream rr payload"
+    );
+    data.to_vec()
+}
+
+fn handle_txt_record(data: &[u8]) -> Option<Vec<u8>> {
+    let txt = flatten_txt_rdata(data);
+    debug!(
+        rr_type = "TXT",
+        raw_payload_len = txt.len(),
+        "downstream rr payload"
+    );
+    match decode_downstream_txt_payload(&txt) {
+        Some(v) => Some(v),
+        None => {
+            let typed_err =
+                ClientError::EncodingError(ClientEncodingError::InvalidTxtPayloadEncoding);
+            warn!(error = %typed_err);
+            None
+        }
+    }
 }
 
 fn decode_base64_payload(encoded: &[u8]) -> Option<Vec<u8>> {
@@ -485,11 +518,40 @@ enum ClientMode {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[allow(clippy::enum_variant_names)]
 enum ClientError {
-    #[error("io error: {0}")]
-    Io(String),
+    #[error("tun error")]
+    TunError(#[source] std::io::Error),
+    #[error("udp error")]
+    UdpError(#[source] std::io::Error),
+    #[error("encoding error: {0}")]
+    EncodingError(ClientEncodingError),
+    #[error("dns error")]
+    DnsError(#[source] crate::dns::DnsError),
     #[error("protocol error: {0}")]
-    Protocol(String),
+    ProtocolError(ClientProtocolError),
+}
+
+#[derive(thiserror::Error, Debug, Clone, Copy)]
+enum ClientEncodingError {
+    #[error("invalid TXT answer payload encoding")]
+    InvalidTxtPayloadEncoding,
+}
+
+#[derive(thiserror::Error, Debug, Clone, Copy)]
+enum ClientProtocolError {
+    #[error("missing VACK")]
+    MissingVack,
+    #[error("LNAK")]
+    LoginNak,
+    #[error("invalid qname")]
+    InvalidQname,
+    #[error("handshake timeout")]
+    HandshakeTimeout,
+    #[error("ancount=0")]
+    EmptyAnswer,
+    #[error("unsupported handshake rr")]
+    UnsupportedHandshakeRr,
 }
 
 async fn perform_handshake(
@@ -498,7 +560,7 @@ async fn perform_handshake(
     topdomain: &str,
     password: &str,
     dns_id: &mut u16,
-    udp_buf: &mut [u8; 2048],
+    udp_buf: &mut [u8; DNS_PACKET_BUFFER_SIZE],
     session: &mut ClientSession,
 ) -> Result<(), ClientError> {
     let (userid, mode) =
@@ -520,16 +582,16 @@ async fn try_handshake(
     topdomain: &str,
     password: &str,
     dns_id: &mut u16,
-    udp_buf: &mut [u8; 2048],
+    udp_buf: &mut [u8; DNS_PACKET_BUFFER_SIZE],
 ) -> Result<(u8, ClientMode), ClientError> {
     let mut version_payload = [0u8; 6];
-    version_payload[..4].copy_from_slice(&0x0000_0502u32.to_be_bytes());
-    let vname = build_handshake_name('v', &version_payload, topdomain)?;
+    version_payload[..4].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    let vname = build_handshake_name(PACKET_TYPE_VERSION, &version_payload, topdomain)?;
     let version_answer =
         send_and_read_first_answer(socket, nameserver, dns_id, udp_buf, &vname, DNS_TYPE_NULL)
             .await?;
-    if version_answer.len() < 9 || &version_answer[..4] != b"VACK" {
-        return Err(ClientError::Protocol("missing VACK".to_string()));
+    if version_answer.len() < 9 || &version_answer[..4] != PACKET_PREFIX_VACK {
+        return Err(ClientError::ProtocolError(ClientProtocolError::MissingVack));
     }
     let seed = u32::from_be_bytes([
         version_answer[4],
@@ -543,12 +605,12 @@ async fn try_handshake(
     let mut login_payload = [0u8; 19];
     login_payload[0] = userid;
     login_payload[1..17].copy_from_slice(&login_hash);
-    let lname = build_handshake_name('l', &login_payload, topdomain)?;
+    let lname = build_handshake_name(PACKET_TYPE_LOGIN, &login_payload, topdomain)?;
     let login_answer =
         send_and_read_first_answer(socket, nameserver, dns_id, udp_buf, &lname, DNS_TYPE_NULL)
             .await?;
-    if login_answer.starts_with(b"LNAK") || login_answer.is_empty() {
-        return Err(ClientError::Protocol("LNAK".to_string()));
+    if login_answer.starts_with(PACKET_PREFIX_LNAK) || login_answer.is_empty() {
+        return Err(ClientError::ProtocolError(ClientProtocolError::LoginNak));
     }
     let mode = if login_answer.windows(6).any(|w| w == b"-1500-") {
         ClientMode::RustCompat
@@ -558,10 +620,10 @@ async fn try_handshake(
     Ok((userid, mode))
 }
 
-fn build_handshake_name(prefix: char, data: &[u8], topdomain: &str) -> Result<String, ClientError> {
+fn build_handshake_name(prefix: u8, data: &[u8], topdomain: &str) -> Result<String, ClientError> {
     let encoded = crate::encoding::base32::encode(data);
     let encoded = crate::encoding::inline_dotify(&encoded);
-    Ok(format!("{prefix}{encoded}.{topdomain}"))
+    Ok(format!("{}{encoded}.{topdomain}", prefix as char))
 }
 
 async fn send_query(
@@ -571,9 +633,20 @@ async fn send_query(
     qtype: u16,
     dns_id: &mut u16,
 ) -> Result<(), ClientError> {
-    let qname_wire = build_qname_wire(qname, "")
-        .ok_or_else(|| ClientError::Protocol("invalid qname".to_string()))?;
-    let mut query = BytesMut::with_capacity(2048);
+    let qname_wire = build_qname_wire(qname, "").ok_or(ClientError::ProtocolError(
+        ClientProtocolError::InvalidQname,
+    ))?;
+    send_query_wire(socket, nameserver, &qname_wire, qtype, dns_id).await
+}
+
+async fn send_query_wire(
+    socket: &UdpSocket,
+    nameserver: SocketAddr,
+    qname_wire: &[u8],
+    qtype: u16,
+    dns_id: &mut u16,
+) -> Result<(), ClientError> {
+    let mut query = BytesMut::with_capacity(DNS_PACKET_BUFFER_SIZE);
     DnsHeader {
         id: *dns_id,
         flags: 0x0100,
@@ -584,7 +657,7 @@ async fn send_query(
     }
     .write_to(&mut query);
     DnsQuestion {
-        qname_wire: &qname_wire,
+        qname_wire,
         qtype,
         qclass: DNS_CLASS_IN,
     }
@@ -593,7 +666,7 @@ async fn send_query(
     socket
         .send_to(&query, nameserver)
         .await
-        .map_err(|e| ClientError::Io(format!("udp send failed: {e}")))?;
+        .map_err(ClientError::UdpError)?;
     Ok(())
 }
 
@@ -601,31 +674,28 @@ async fn send_and_read_first_answer(
     socket: &UdpSocket,
     nameserver: SocketAddr,
     dns_id: &mut u16,
-    udp_buf: &mut [u8; 2048],
+    udp_buf: &mut [u8; DNS_PACKET_BUFFER_SIZE],
     qname: &str,
     qtype: u16,
 ) -> Result<Vec<u8>, ClientError> {
     send_query(socket, nameserver, qname, qtype, dns_id).await?;
     let recv = timeout(Duration::from_secs(2), socket.recv_from(udp_buf))
         .await
-        .map_err(|_| ClientError::Protocol("handshake timeout".to_string()))?
-        .map_err(|e| ClientError::Io(format!("udp recv failed: {e}")))?;
+        .map_err(|_| ClientError::ProtocolError(ClientProtocolError::HandshakeTimeout))?
+        .map_err(ClientError::UdpError)?;
     let (len, _) = recv;
     let mut cur = Cursor::new(&udp_buf[..len]);
-    let header = DnsHeader::parse(&mut cur)
-        .map_err(|e| ClientError::Protocol(format!("dns header: {e}")))?;
-    let _question = DnsQuestion::parse(&mut cur)
-        .map_err(|e| ClientError::Protocol(format!("dns question: {e}")))?;
+    let header = DnsHeader::parse(&mut cur).map_err(ClientError::DnsError)?;
+    let _question = DnsQuestion::parse(&mut cur).map_err(ClientError::DnsError)?;
     if header.ancount == 0 {
-        return Err(ClientError::Protocol("ancount=0".to_string()));
+        return Err(ClientError::ProtocolError(ClientProtocolError::EmptyAnswer));
     }
-    let rr = DnsResourceRecord::parse(&mut cur)
-        .map_err(|e| ClientError::Protocol(format!("dns answer: {e}")))?;
+    let rr = DnsResourceRecord::parse(&mut cur).map_err(ClientError::DnsError)?;
     match rr.rdata {
         DnsRdata::Null(data) => Ok(data.to_vec()),
         DnsRdata::Txt(data) => Ok(flatten_txt_rdata(data)),
-        _ => Err(ClientError::Protocol(
-            "unsupported handshake rr".to_string(),
+        _ => Err(ClientError::ProtocolError(
+            ClientProtocolError::UnsupportedHandshakeRr,
         )),
     }
 }
@@ -638,13 +708,23 @@ fn build_upstream_header(
     down_frag: u8,
     is_last: bool,
     cmc: usize,
-) -> String {
+) -> [u8; 5] {
     const CMC: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let c1 = crate::encoding::base32::b32_5to8(((up_seq & 0x07) << 2) | ((up_frag & 0x0f) >> 2));
-    let c2 = crate::encoding::base32::b32_5to8(((up_frag & 0x03) << 3) | (down_seq & 0x07));
-    let c3 = crate::encoding::base32::b32_5to8(((down_frag & 0x0f) << 1) | u8::from(is_last));
-    let c4 = CMC[cmc % CMC.len()];
-    String::from_utf8(vec![userid_char, c1, c2, c3, c4]).expect("header is ascii")
+    let packed = UpstreamHeader {
+        up_seq,
+        up_frag,
+        down_seq,
+        down_frag,
+        last_frag: is_last,
+    }
+    .encode_chars();
+    [
+        userid_char,
+        packed[0],
+        packed[1],
+        packed[2],
+        CMC[cmc % CMC.len()],
+    ]
 }
 
 fn compress_zlib(data: &[u8]) -> Option<Vec<u8>> {
@@ -670,7 +750,7 @@ async fn send_c_ping(
     *rand_seed = rand_seed.wrapping_add(1);
     let encoded = crate::encoding::base32::encode(&payload);
     let encoded = crate::encoding::inline_dotify(&encoded);
-    let qname = format!("p{encoded}.{topdomain}");
+    let qname = format!("{}{encoded}.{topdomain}", PACKET_TYPE_PING as char);
     send_query(socket, nameserver, &qname, DNS_TYPE_NULL, dns_id).await
 }
 
