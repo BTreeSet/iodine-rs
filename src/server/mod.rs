@@ -37,10 +37,9 @@ use crate::dns::{
 };
 use crate::encoding::framing::UpstreamHeader;
 use crate::protocol::{
-    DNS_PACKET_BUFFER_SIZE, PACKET_TYPE_CODEC, PACKET_TYPE_CODEC_CHECK, PACKET_TYPE_ECHO,
-    PACKET_TYPE_ENCODING, PACKET_TYPE_FRAG_ACK, PACKET_TYPE_FRAG_SIZE, PACKET_TYPE_IP,
-    PACKET_PREFIX_VACK, PACKET_TYPE_LOGIN, PACKET_TYPE_PING, PACKET_TYPE_VERSION,
-    PROTOCOL_VERSION,
+    DNS_PACKET_BUFFER_SIZE, PACKET_PREFIX_VACK, PACKET_TYPE_CODEC, PACKET_TYPE_CODEC_CHECK,
+    PACKET_TYPE_ECHO, PACKET_TYPE_ENCODING, PACKET_TYPE_FRAG_ACK, PACKET_TYPE_FRAG_SIZE,
+    PACKET_TYPE_IP, PACKET_TYPE_LOGIN, PACKET_TYPE_PING, PACKET_TYPE_VERSION, PROTOCOL_VERSION,
 };
 
 const IPV4_MIN_HEADER_LEN: usize = 20;
@@ -292,8 +291,8 @@ async fn handle_data_packet(
 ) -> Result<(), ServerError> {
     let session_id = session_id_for(handshake, user_id);
     let codec = state.user_codec_or_default(session_id, Codec::Base32);
-    let decoded =
-        decode_upstream_payload(codec, encoded_payload).map_err(|e| ServerError::Encoding(e.to_string()))?;
+    let decoded = decode_upstream_payload(codec, encoded_payload)
+        .map_err(|e| ServerError::Encoding(e.to_string()))?;
     let _ = state.process_downstream_ack(session_id, down_seq, down_frag);
     let assembled = state.push_upstream_fragment(session_id, up_seq, up_frag, &decoded, last_frag);
     let Ok(Some(compressed_packet)) = assembled else {
@@ -471,8 +470,7 @@ fn decode_upstream_payload(
     codec: Codec,
     payload: &[u8],
 ) -> Result<Bytes, crate::encoding::EncodingError> {
-    let non_dot_len = payload.iter().filter(|b| **b != b'.').count();
-    let mut undotified = BytesMut::with_capacity(non_dot_len);
+    let mut undotified = BytesMut::with_capacity(payload.len());
     undotified.extend(payload.iter().copied().filter(|b| *b != b'.'));
     crate::encoding::decode_upstream(codec, &undotified)
 }
@@ -565,7 +563,7 @@ fn qname_data_prefix(qname_wire: &[u8], topdomain_labels: &[Vec<u8>]) -> Option<
         .iter()
         .map(|label| label.len())
         .sum::<usize>()
-        + (prefix_count - 1);
+        + prefix_count.saturating_sub(1);
     let mut prefix = Vec::with_capacity(total_len);
     for (idx, label) in labels[..prefix_count].iter().enumerate() {
         if idx > 0 {
@@ -702,8 +700,16 @@ async fn handle_control_request(
             })
         }
         PACKET_TYPE_LOGIN => {
-            handle_login_packet(query, state, handshake, password, tun_ip, tun_netmask, rr_type)
-                .await
+            handle_login_packet(
+                query,
+                state,
+                handshake,
+                password,
+                tun_ip,
+                tun_netmask,
+                rr_type,
+            )
+            .await
         }
         PACKET_TYPE_IP => {
             let mut payload = Vec::with_capacity(5);

@@ -116,8 +116,8 @@ pub async fn run(args: ClientArgs) {
                         handle_tun_read(&tun_buf[..len], &mut state, &socket).await;
                     }
                     Err(err) => {
-                        let typed_err = ClientError::TunError(err.to_string());
-                        warn!(error = %typed_err, "tun read failed");
+                        let typed_err = ClientError::TunError(err);
+                        warn!(error = %typed_err);
                     }
                 }
             }
@@ -205,6 +205,10 @@ async fn handle_tun_read(tun_packet: &[u8], state: &mut ClientState, socket: &Ud
         query_prefix.extend_from_slice(&header);
         query_prefix.extend_from_slice(&dotified);
         let Some(qname_wire) = build_qname_wire_bytes(&query_prefix, &state.topdomain) else {
+            warn!(
+                session_user = state.session.userid,
+                seq, frag, "failed to build upstream qname wire"
+            );
             break;
         };
         if send_query_wire(
@@ -322,6 +326,7 @@ fn build_qname_wire(first_label: &str, topdomain: &str) -> Option<Vec<u8>> {
     build_qname_wire_bytes(first_label.as_bytes(), topdomain)
 }
 
+/// Trims leading and trailing ASCII dots from a byte slice.
 fn trim_ascii_dots(mut input: &[u8]) -> &[u8] {
     let start = input.iter().position(|&b| b != b'.').unwrap_or(input.len());
     input = &input[start..];
@@ -395,8 +400,8 @@ fn handle_txt_record(data: &[u8]) -> Option<Vec<u8>> {
         Some(v) => Some(v),
         None => {
             let typed_err =
-                ClientError::EncodingError("invalid TXT answer payload encoding".to_string());
-            warn!(error = %typed_err, "invalid TXT answer payload encoding");
+                ClientError::EncodingError(ClientEncodingError::InvalidTxtPayloadEncoding);
+            warn!(error = %typed_err);
             None
         }
     }
@@ -515,16 +520,38 @@ enum ClientMode {
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
 enum ClientError {
-    #[error("tun error: {0}")]
-    TunError(String),
-    #[error("udp error: {0}")]
-    UdpError(String),
+    #[error("tun error")]
+    TunError(#[source] std::io::Error),
+    #[error("udp error")]
+    UdpError(#[source] std::io::Error),
     #[error("encoding error: {0}")]
-    EncodingError(String),
-    #[error("dns error: {0}")]
-    DnsError(String),
+    EncodingError(ClientEncodingError),
+    #[error("dns error")]
+    DnsError(#[source] crate::dns::DnsError),
     #[error("protocol error: {0}")]
-    ProtocolError(String),
+    ProtocolError(ClientProtocolError),
+}
+
+#[derive(thiserror::Error, Debug, Clone, Copy)]
+enum ClientEncodingError {
+    #[error("invalid TXT answer payload encoding")]
+    InvalidTxtPayloadEncoding,
+}
+
+#[derive(thiserror::Error, Debug, Clone, Copy)]
+enum ClientProtocolError {
+    #[error("missing VACK")]
+    MissingVack,
+    #[error("LNAK")]
+    LoginNak,
+    #[error("invalid qname")]
+    InvalidQname,
+    #[error("handshake timeout")]
+    HandshakeTimeout,
+    #[error("ancount=0")]
+    EmptyAnswer,
+    #[error("unsupported handshake rr")]
+    UnsupportedHandshakeRr,
 }
 
 async fn perform_handshake(
@@ -564,7 +591,7 @@ async fn try_handshake(
         send_and_read_first_answer(socket, nameserver, dns_id, udp_buf, &vname, DNS_TYPE_NULL)
             .await?;
     if version_answer.len() < 9 || &version_answer[..4] != PACKET_PREFIX_VACK {
-        return Err(ClientError::ProtocolError("missing VACK".to_string()));
+        return Err(ClientError::ProtocolError(ClientProtocolError::MissingVack));
     }
     let seed = u32::from_be_bytes([
         version_answer[4],
@@ -583,7 +610,7 @@ async fn try_handshake(
         send_and_read_first_answer(socket, nameserver, dns_id, udp_buf, &lname, DNS_TYPE_NULL)
             .await?;
     if login_answer.starts_with(PACKET_PREFIX_LNAK) || login_answer.is_empty() {
-        return Err(ClientError::ProtocolError("LNAK".to_string()));
+        return Err(ClientError::ProtocolError(ClientProtocolError::LoginNak));
     }
     let mode = if login_answer.windows(6).any(|w| w == b"-1500-") {
         ClientMode::RustCompat
@@ -606,8 +633,9 @@ async fn send_query(
     qtype: u16,
     dns_id: &mut u16,
 ) -> Result<(), ClientError> {
-    let qname_wire = build_qname_wire(qname, "")
-        .ok_or_else(|| ClientError::ProtocolError("invalid qname".to_string()))?;
+    let qname_wire = build_qname_wire(qname, "").ok_or(ClientError::ProtocolError(
+        ClientProtocolError::InvalidQname,
+    ))?;
     send_query_wire(socket, nameserver, &qname_wire, qtype, dns_id).await
 }
 
@@ -638,7 +666,7 @@ async fn send_query_wire(
     socket
         .send_to(&query, nameserver)
         .await
-        .map_err(|e| ClientError::UdpError(format!("udp send failed: {e}")))?;
+        .map_err(ClientError::UdpError)?;
     Ok(())
 }
 
@@ -653,24 +681,21 @@ async fn send_and_read_first_answer(
     send_query(socket, nameserver, qname, qtype, dns_id).await?;
     let recv = timeout(Duration::from_secs(2), socket.recv_from(udp_buf))
         .await
-        .map_err(|_| ClientError::ProtocolError("handshake timeout".to_string()))?
-        .map_err(|e| ClientError::UdpError(format!("udp recv failed: {e}")))?;
+        .map_err(|_| ClientError::ProtocolError(ClientProtocolError::HandshakeTimeout))?
+        .map_err(ClientError::UdpError)?;
     let (len, _) = recv;
     let mut cur = Cursor::new(&udp_buf[..len]);
-    let header =
-        DnsHeader::parse(&mut cur).map_err(|e| ClientError::DnsError(format!("dns header: {e}")))?;
-    let _question = DnsQuestion::parse(&mut cur)
-        .map_err(|e| ClientError::DnsError(format!("dns question: {e}")))?;
+    let header = DnsHeader::parse(&mut cur).map_err(ClientError::DnsError)?;
+    let _question = DnsQuestion::parse(&mut cur).map_err(ClientError::DnsError)?;
     if header.ancount == 0 {
-        return Err(ClientError::ProtocolError("ancount=0".to_string()));
+        return Err(ClientError::ProtocolError(ClientProtocolError::EmptyAnswer));
     }
-    let rr = DnsResourceRecord::parse(&mut cur)
-        .map_err(|e| ClientError::DnsError(format!("dns answer: {e}")))?;
+    let rr = DnsResourceRecord::parse(&mut cur).map_err(ClientError::DnsError)?;
     match rr.rdata {
         DnsRdata::Null(data) => Ok(data.to_vec()),
         DnsRdata::Txt(data) => Ok(flatten_txt_rdata(data)),
         _ => Err(ClientError::ProtocolError(
-            "unsupported handshake rr".to_string(),
+            ClientProtocolError::UnsupportedHandshakeRr,
         )),
     }
 }
