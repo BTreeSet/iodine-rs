@@ -162,7 +162,8 @@ async fn handle_udp_packet(
     if !qname_matches_topdomain(question.qname_wire, &ctx.topdomain_labels) {
         return Ok(());
     }
-    let query_prefix = qname_data_prefix(question.qname_wire, &ctx.topdomain_labels).unwrap_or_default();
+    let query_prefix =
+        qname_data_prefix(question.qname_wire, &ctx.topdomain_labels).unwrap_or_default();
 
     let first_label = first_label_bytes(question.qname_wire).ok_or_else(|| {
         ServerError::InvalidPacket("dns question missing first label".to_string())
@@ -394,7 +395,7 @@ fn parse_upstream_query(data: &[u8]) -> Option<UpstreamQuery<'_>> {
     if data.len() < 6 {
         return None;
     }
-    let packed = UpstreamHeader::parse_encoded([data[1], data[2], data[3]]);
+    let packed = UpstreamHeader::parse_encoded([data[1], data[2], data[3]])?;
     Some(UpstreamQuery::Data {
         user_id,
         up_seq: packed.up_seq,
@@ -410,7 +411,8 @@ fn decode_upstream_payload(
     codec: Codec,
     payload: &[u8],
 ) -> Result<Bytes, crate::encoding::EncodingError> {
-    let mut undotified = BytesMut::with_capacity(payload.len());
+    let non_dot_len = payload.iter().filter(|b| **b != b'.').count();
+    let mut undotified = BytesMut::with_capacity(non_dot_len);
     undotified.extend(payload.iter().copied().filter(|b| *b != b'.'));
     crate::encoding::decode_upstream(codec, &undotified)
 }
@@ -446,7 +448,7 @@ fn first_label_bytes(qname_wire: &[u8]) -> Option<&[u8]> {
     Some(&qname_wire[1..=len])
 }
 
-fn parse_qname_labels<'a>(qname_wire: &'a [u8]) -> Option<Vec<&'a [u8]>> {
+fn parse_qname_labels(qname_wire: &[u8]) -> Option<Vec<&[u8]>> {
     let mut labels = Vec::new();
     let mut pos = 0usize;
     loop {
@@ -499,8 +501,11 @@ fn qname_data_prefix(qname_wire: &[u8], topdomain_labels: &[Vec<u8>]) -> Option<
     if prefix_count == 0 {
         return Some(Vec::new());
     }
-    let total_len: usize =
-        labels[..prefix_count].iter().map(|label| label.len()).sum::<usize>() + (prefix_count - 1);
+    let total_len: usize = labels[..prefix_count]
+        .iter()
+        .map(|label| label.len())
+        .sum::<usize>()
+        + (prefix_count - 1);
     let mut prefix = Vec::with_capacity(total_len);
     for (idx, label) in labels[..prefix_count].iter().enumerate() {
         if idx > 0 {

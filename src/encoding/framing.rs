@@ -29,7 +29,9 @@ impl DownstreamHeader {
     pub fn to_bytes(self) -> [u8; 2] {
         [
             ((self.up_ack_seq & 0x07) << 4) | (self.up_ack_frag & 0x0f),
-            ((self.down_seq & 0x07) << 5) | ((self.down_frag & 0x0f) << 1) | u8::from(self.last_frag),
+            ((self.down_seq & 0x07) << 5)
+                | ((self.down_frag & 0x0f) << 1)
+                | u8::from(self.last_frag),
         ]
     }
 }
@@ -44,17 +46,20 @@ pub struct UpstreamHeader {
 }
 
 impl UpstreamHeader {
-    pub fn parse_encoded(chars: [u8; 3]) -> Self {
+    pub fn parse_encoded(chars: [u8; 3]) -> Option<Self> {
+        if !chars.iter().all(|b| is_base32_symbol(*b)) {
+            return None;
+        }
         let c1 = b32_8to5(chars[0]);
         let c2 = b32_8to5(chars[1]);
         let c3 = b32_8to5(chars[2]);
-        Self {
+        Some(Self {
             up_seq: (c1 >> 2) & 0x07,
             up_frag: ((c1 & 0x03) << 2) | ((c2 >> 3) & 0x03),
             down_seq: c2 & 0x07,
             down_frag: (c3 >> 1) & 0x0f,
             last_frag: (c3 & 0x01) != 0,
-        }
+        })
     }
 
     pub fn encode_chars(self) -> [u8; 3] {
@@ -68,4 +73,8 @@ impl UpstreamHeader {
     pub fn parse_ack_byte(byte: u8) -> (u8, u8) {
         ((byte >> 4) & 0x07, byte & 0x0f)
     }
+}
+
+fn is_base32_symbol(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || (b'0'..=b'5').contains(&byte)
 }

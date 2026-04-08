@@ -196,10 +196,10 @@ async fn handle_tun_read(tun_packet: &[u8], state: &mut ClientState, socket: &Ud
         state.session.next_cmc = (state.session.next_cmc + 1) % 36;
         let encoded_chunk = crate::encoding::base32::encode(chunk);
         let dotified = crate::encoding::inline_dotify_bytes(encoded_chunk.as_bytes());
-        let mut first_label = BytesMut::with_capacity(header.len() + dotified.len());
-        first_label.extend_from_slice(&header);
-        first_label.extend_from_slice(&dotified);
-        let Some(qname_wire) = build_qname_wire_bytes(&first_label, &state.topdomain) else {
+        let mut query_prefix = BytesMut::with_capacity(header.len() + dotified.len());
+        query_prefix.extend_from_slice(&header);
+        query_prefix.extend_from_slice(&dotified);
+        let Some(qname_wire) = build_qname_wire_bytes(&query_prefix, &state.topdomain) else {
             break;
         };
         if send_query_wire(
@@ -291,10 +291,12 @@ async fn handle_udp_read(
         "downstream fragment header"
     );
 
-    if let Some(packet) = state
-        .downstream
-        .push_fragment(header.down_seq, header.down_frag, fragment, header.last_frag)
-    {
+    if let Some(packet) = state.downstream.push_fragment(
+        header.down_seq,
+        header.down_frag,
+        fragment,
+        header.last_frag,
+    ) {
         let ip_packet = if state.session.mode == ClientMode::CCompat {
             strip_tun_header(&packet)
         } else {
@@ -334,13 +336,14 @@ fn build_qname_wire(first_label: &str, topdomain: &str) -> Option<Vec<u8>> {
 }
 
 fn trim_ascii_dots(mut input: &[u8]) -> &[u8] {
-    while input.first() == Some(&b'.') {
-        input = &input[1..];
-    }
-    while input.last() == Some(&b'.') {
-        input = &input[..input.len() - 1];
-    }
-    input
+    let start = input.iter().position(|&b| b != b'.').unwrap_or(input.len());
+    input = &input[start..];
+    let end = input
+        .iter()
+        .rposition(|&b| b != b'.')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    &input[..end]
 }
 
 fn append_qname_parts(out: &mut Vec<u8>, dotted: &[u8]) -> Option<()> {
@@ -669,7 +672,13 @@ fn build_upstream_header(
         last_frag: is_last,
     }
     .encode_chars();
-    [userid_char, packed[0], packed[1], packed[2], CMC[cmc % CMC.len()]]
+    [
+        userid_char,
+        packed[0],
+        packed[1],
+        packed[2],
+        CMC[cmc % CMC.len()],
+    ]
 }
 
 fn compress_zlib(data: &[u8]) -> Option<Vec<u8>> {

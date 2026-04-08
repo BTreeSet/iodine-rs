@@ -5,7 +5,10 @@ pub mod base64u;
 pub mod framing;
 pub mod hostname;
 
-pub use hostname::{build_hostname, inline_dotify, inline_undotify, unpack_data, EncoderKind};
+pub use hostname::{
+    build_hostname, inline_dotify, inline_dotify_bytes, inline_undotify, inline_undotify_bytes,
+    unpack_data, EncoderKind,
+};
 
 use crate::server::state::Codec;
 use bytes::Bytes;
