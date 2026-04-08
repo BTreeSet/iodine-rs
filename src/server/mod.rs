@@ -36,10 +36,15 @@ use crate::dns::{
     DnsHeader, DnsQuestion, DnsRdata, DnsResourceRecord, DNS_CLASS_IN, DNS_TYPE_NULL, DNS_TYPE_TXT,
 };
 use crate::encoding::framing::UpstreamHeader;
+use crate::protocol::{
+    DNS_PACKET_BUFFER_SIZE, PACKET_TYPE_CODEC, PACKET_TYPE_CODEC_CHECK, PACKET_TYPE_ECHO,
+    PACKET_TYPE_ENCODING, PACKET_TYPE_FRAG_ACK, PACKET_TYPE_FRAG_SIZE, PACKET_TYPE_IP,
+    PACKET_PREFIX_VACK, PACKET_TYPE_LOGIN, PACKET_TYPE_PING, PACKET_TYPE_VERSION,
+    PROTOCOL_VERSION,
+};
 
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV4_DST_OFFSET: usize = 16;
-const PROTOCOL_VERSION: u32 = 0x0000_0502;
 const DNS_FLAGS_RESPONSE_RA: u16 = 0x8000 | 0x0080;
 const DNS_FLAGS_CLEAR_AA_MASK: u16 = !0x0200;
 const CONTROL_BADLEN: &[u8] = b"BADLEN";
@@ -99,8 +104,8 @@ pub async fn run(args: ServerArgs) {
         .expect("failed to bind UDP socket");
     info!(%bind_addr, %topdomain, "Server listening on UDP DNS socket");
 
-    let mut udp_buf = [0u8; 2048];
-    let mut tun_buf = [0u8; 2048];
+    let mut udp_buf = [0u8; DNS_PACKET_BUFFER_SIZE];
+    let mut tun_buf = [0u8; DNS_PACKET_BUFFER_SIZE];
     let mut handshake = HandshakeState::default();
     let udp_ctx = UdpContext {
         topdomain_labels: split_topdomain_labels(&topdomain),
@@ -180,7 +185,9 @@ async fn handle_udp_packet(
         &ctx.password,
         ctx.tun_ip,
         ctx.tun_netmask,
-    ) {
+    )
+    .await
+    {
         send_rr_response(
             socket,
             peer,
@@ -204,13 +211,10 @@ async fn handle_udp_packet(
             down_seq,
             down_frag,
         } => {
-            let session_id = handshake
-                .session_id_by_handshake_user
-                .get(&user_id)
-                .copied()
-                .unwrap_or(user_id);
-            let _ = state.process_downstream_ack(session_id, down_seq, down_frag);
-            send_data_response(socket, peer, &header, question, state, session_id).await?;
+            handle_ping_packet(
+                state, socket, peer, &header, question, handshake, user_id, down_seq, down_frag,
+            )
+            .await?;
         }
         UpstreamQuery::Data {
             user_id,
@@ -221,41 +225,97 @@ async fn handle_udp_packet(
             last_frag,
             encoded_payload,
         } => {
-            let session_id = handshake
-                .session_id_by_handshake_user
-                .get(&user_id)
-                .copied()
-                .unwrap_or(user_id);
-            let codec = state.user_codec_or_default(session_id, Codec::Base32);
-            let decoded = decode_upstream_payload(codec, encoded_payload)
-                .map_err(|e| ServerError::Encoding(e.to_string()))?;
-            let _ = state.process_downstream_ack(session_id, down_seq, down_frag);
-            let assembled =
-                state.push_upstream_fragment(session_id, up_seq, up_frag, &decoded, last_frag);
-            let Ok(Some(compressed_packet)) = assembled else {
-                send_data_response(socket, peer, &header, question, state, session_id).await?;
-                return Ok(());
-            };
-            let mut decoder = ZlibDecoder::new(&compressed_packet[..]);
-            let mut inflated = Vec::new();
-            decoder
-                .read_to_end(&mut inflated)
-                .map_err(|e| ServerError::InvalidPacket(format!("zlib decode failed: {e}")))?;
-            let packet = strip_tun_pi_if_present(&inflated);
-            let ip_version = packet.first().map(|b| b >> 4).unwrap_or(0);
-            if ip_version != 4 {
-                debug!(session_id, ip_version, "dropping non-ipv4 upstream packet");
-                send_data_response(socket, peer, &header, question, state, session_id).await?;
-                return Ok(());
-            }
-            tun.write_all(packet)
-                .await
-                .map_err(|e| ServerError::Io(format!("tun write failed: {e}")))?;
-            send_data_response(socket, peer, &header, question, state, session_id).await?;
+            handle_data_packet(
+                state,
+                socket,
+                tun,
+                peer,
+                &header,
+                question,
+                handshake,
+                user_id,
+                up_seq,
+                up_frag,
+                down_seq,
+                down_frag,
+                last_frag,
+                encoded_payload,
+            )
+            .await?;
         }
     }
 
     Ok(())
+}
+
+fn session_id_for(handshake: &HandshakeState, user_id: u32) -> u32 {
+    handshake
+        .session_id_by_handshake_user
+        .get(&user_id)
+        .copied()
+        .unwrap_or(user_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_ping_packet(
+    state: &ServerState,
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    header: &DnsHeader,
+    question: DnsQuestion<'_>,
+    handshake: &HandshakeState,
+    user_id: u32,
+    down_seq: u8,
+    down_frag: u8,
+) -> Result<(), ServerError> {
+    let session_id = session_id_for(handshake, user_id);
+    let _ = state.process_downstream_ack(session_id, down_seq, down_frag);
+    send_data_response(socket, peer, header, question, state, session_id).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_data_packet(
+    state: &ServerState,
+    socket: &UdpSocket,
+    tun: &mut tun::AsyncDevice,
+    peer: SocketAddr,
+    header: &DnsHeader,
+    question: DnsQuestion<'_>,
+    handshake: &HandshakeState,
+    user_id: u32,
+    up_seq: u8,
+    up_frag: u8,
+    down_seq: u8,
+    down_frag: u8,
+    last_frag: bool,
+    encoded_payload: &[u8],
+) -> Result<(), ServerError> {
+    let session_id = session_id_for(handshake, user_id);
+    let codec = state.user_codec_or_default(session_id, Codec::Base32);
+    let decoded =
+        decode_upstream_payload(codec, encoded_payload).map_err(|e| ServerError::Encoding(e.to_string()))?;
+    let _ = state.process_downstream_ack(session_id, down_seq, down_frag);
+    let assembled = state.push_upstream_fragment(session_id, up_seq, up_frag, &decoded, last_frag);
+    let Ok(Some(compressed_packet)) = assembled else {
+        send_data_response(socket, peer, header, question, state, session_id).await?;
+        return Ok(());
+    };
+    let mut decoder = ZlibDecoder::new(&compressed_packet[..]);
+    let mut inflated = Vec::new();
+    decoder
+        .read_to_end(&mut inflated)
+        .map_err(|e| ServerError::InvalidPacket(format!("zlib decode failed: {e}")))?;
+    let packet = strip_tun_pi_if_present(&inflated);
+    let ip_version = packet.first().map(|b| b >> 4).unwrap_or(0);
+    if ip_version != 4 {
+        debug!(session_id, ip_version, "dropping non-ipv4 upstream packet");
+        send_data_response(socket, peer, header, question, state, session_id).await?;
+        return Ok(());
+    }
+    tun.write_all(packet)
+        .await
+        .map_err(|e| ServerError::Io(format!("tun write failed: {e}")))?;
+    send_data_response(socket, peer, header, question, state, session_id).await
 }
 
 async fn handle_tun_packet(state: &ServerState, packet: &[u8]) -> Result<(), ServerError> {
@@ -378,7 +438,7 @@ enum UpstreamQuery<'a> {
 
 fn parse_upstream_query(data: &[u8]) -> Option<UpstreamQuery<'_>> {
     let (&first, rest) = data.split_first()?;
-    if first.eq_ignore_ascii_case(&b'p') {
+    if first.eq_ignore_ascii_case(&PACKET_TYPE_PING) {
         let decoded = decode_upstream_payload(Codec::Base32, rest).ok()?;
         if decoded.len() < 2 {
             return None;
@@ -561,7 +621,7 @@ impl Default for HandshakeState {
     }
 }
 
-fn handle_control_request(
+async fn handle_control_request(
     query: ControlQuery<'_>,
     state: &ServerState,
     handshake: &mut HandshakeState,
@@ -572,7 +632,7 @@ fn handle_control_request(
     let first_char = *query.first_label.first()?;
     let rr_type = response_rr_type(query.request_qtype);
     match first_char.to_ascii_lowercase() {
-        b'y' => {
+        PACKET_TYPE_CODEC_CHECK => {
             if query.first_label.len() < 3 {
                 return Some(ControlResponse {
                     rr_type,
@@ -603,7 +663,7 @@ fn handle_control_request(
                 payload: DOWNCODECCHECK1.to_vec(),
             })
         }
-        b'v' => {
+        PACKET_TYPE_VERSION => {
             let decoded = crate::encoding::base32::decode_bytes(&query.first_label[1..]).ok()?;
             if decoded.len() < 4 {
                 return Some(ControlResponse {
@@ -624,7 +684,7 @@ fn handle_control_request(
                     handshake.login_challenge_seed.wrapping_add(0x1021);
                 handshake.pending_login_challenges.insert(userid, seed);
                 let mut out = Vec::with_capacity(9);
-                out.extend_from_slice(b"VACK");
+                out.extend_from_slice(PACKET_PREFIX_VACK);
                 out.extend_from_slice(&seed.to_be_bytes());
                 out.push(userid);
                 return Some(ControlResponse {
@@ -641,106 +701,22 @@ fn handle_control_request(
                 payload: out,
             })
         }
-        b'l' => {
-            let decoded = crate::encoding::base32::decode_bytes(&query.first_label[1..]).ok()?;
-            if decoded.len() < 17 {
-                return Some(ControlResponse {
-                    rr_type,
-                    payload: CONTROL_BADLEN.to_vec(),
-                });
-            }
-            let userid = decoded[0];
-            let Some(seed) = handshake.pending_login_challenges.get(&userid).copied() else {
-                return Some(ControlResponse {
-                    rr_type,
-                    payload: b"BADIP".to_vec(),
-                });
-            };
-            let expected_hash = login_hash(password, seed);
-            if !constant_time_eq_16(&decoded[1..17], &expected_hash) {
-                return Some(ControlResponse {
-                    rr_type,
-                    payload: b"LNAK".to_vec(),
-                });
-            }
-            let mut supplied_hash = [0u8; 16];
-            supplied_hash.copy_from_slice(&decoded[1..17]);
-            let username = format!("user-{userid}");
-            let created_id = state.add_user(username.clone(), supplied_hash);
-            let client_ip = match state.create_session(&username, supplied_hash) {
-                Ok((_, ip)) => ip,
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        userid,
-                        "dropping packet: session allocation failed during login"
-                    );
-                    Ipv4Addr::new(10, 0, 0, 2)
-                }
-            };
-            let _ = state.set_user_codec(created_id, Codec::Base32);
-            handshake
-                .session_id_by_handshake_user
-                .insert(userid as u32, created_id);
-            handshake.pending_login_challenges.remove(&userid);
-            let payload = format!(
-                "{}-{}-1500-{}",
-                tun_ip,
-                client_ip,
-                ipv4_netmask_prefix(tun_netmask)
-            )
-            .into_bytes();
-            Some(ControlResponse { rr_type, payload })
+        PACKET_TYPE_LOGIN => {
+            handle_login_packet(query, state, handshake, password, tun_ip, tun_netmask, rr_type)
+                .await
         }
-        b'i' => {
+        PACKET_TYPE_IP => {
             let mut payload = Vec::with_capacity(5);
             payload.push(b'I');
             payload.extend_from_slice(&tun_ip.octets());
             Some(ControlResponse { rr_type, payload })
         }
-        b'z' => Some(ControlResponse {
+        PACKET_TYPE_ECHO => Some(ControlResponse {
             rr_type,
             payload: query.query_data_prefix.to_vec(),
         }),
-        b's' => {
-            if query.first_label.len() < 3 {
-                return Some(ControlResponse {
-                    rr_type,
-                    payload: CONTROL_BADLEN.to_vec(),
-                });
-            }
-            let handshake_user = decode_base32_char(query.first_label[1]).unwrap_or(0) as u32;
-            let session_id = handshake
-                .session_id_by_handshake_user
-                .get(&handshake_user)
-                .copied()
-                .unwrap_or(handshake_user);
-            let codec_id = decode_base32_char(query.first_label[2]).unwrap_or(0);
-            let payload = match codec_id {
-                5 => {
-                    let _ = state.set_user_codec(session_id, Codec::Base32);
-                    b"Base32".to_vec()
-                }
-                6 => {
-                    let _ = state.set_user_codec(session_id, Codec::Base64);
-                    let _ = state.set_use_tun_pi(session_id, true);
-                    b"Base64".to_vec()
-                }
-                26 => {
-                    let _ = state.set_user_codec(session_id, Codec::Base64u);
-                    let _ = state.set_use_tun_pi(session_id, true);
-                    b"Base64u".to_vec()
-                }
-                7 => {
-                    let _ = state.set_user_codec(session_id, Codec::Base128);
-                    let _ = state.set_use_tun_pi(session_id, true);
-                    b"Base128".to_vec()
-                }
-                _ => b"BADCODEC".to_vec(),
-            };
-            Some(ControlResponse { rr_type, payload })
-        }
-        b'o' => {
+        PACKET_TYPE_CODEC => handle_codec_packet(query, state, handshake, rr_type).await,
+        PACKET_TYPE_ENCODING => {
             if query.first_label.len() < 3 {
                 return Some(ControlResponse {
                     rr_type,
@@ -759,7 +735,7 @@ fn handle_control_request(
             };
             Some(ControlResponse { rr_type, payload })
         }
-        b'r' => {
+        PACKET_TYPE_FRAG_SIZE => {
             if query.first_label.len() < 4 {
                 return Some(ControlResponse {
                     rr_type,
@@ -789,7 +765,7 @@ fn handle_control_request(
             }
             Some(ControlResponse { rr_type, payload })
         }
-        b'n' => {
+        PACKET_TYPE_FRAG_ACK => {
             let decoded = crate::encoding::base32::decode_bytes(&query.first_label[1..]).ok()?;
             if decoded.len() < 3 {
                 return Some(ControlResponse {
@@ -805,6 +781,106 @@ fn handle_control_request(
         }
         _ => None,
     }
+}
+
+async fn handle_login_packet(
+    query: ControlQuery<'_>,
+    state: &ServerState,
+    handshake: &mut HandshakeState,
+    password: &str,
+    tun_ip: Ipv4Addr,
+    tun_netmask: Ipv4Addr,
+    rr_type: u16,
+) -> Option<ControlResponse> {
+    let decoded = crate::encoding::base32::decode_bytes(&query.first_label[1..]).ok()?;
+    if decoded.len() < 17 {
+        return Some(ControlResponse {
+            rr_type,
+            payload: CONTROL_BADLEN.to_vec(),
+        });
+    }
+    let userid = decoded[0];
+    let Some(seed) = handshake.pending_login_challenges.get(&userid).copied() else {
+        return Some(ControlResponse {
+            rr_type,
+            payload: b"BADIP".to_vec(),
+        });
+    };
+    let expected_hash = login_hash(password, seed);
+    if !constant_time_eq_16(&decoded[1..17], &expected_hash) {
+        return Some(ControlResponse {
+            rr_type,
+            payload: crate::protocol::PACKET_PREFIX_LNAK.to_vec(),
+        });
+    }
+    let mut supplied_hash = [0u8; 16];
+    supplied_hash.copy_from_slice(&decoded[1..17]);
+    let username = format!("user-{userid}");
+    let created_id = state.add_user(username.clone(), supplied_hash);
+    let client_ip = match state.create_session(&username, supplied_hash) {
+        Ok((_, ip)) => ip,
+        Err(err) => {
+            warn!(
+                error = %err,
+                userid,
+                "dropping packet: session allocation failed during login"
+            );
+            Ipv4Addr::new(10, 0, 0, 2)
+        }
+    };
+    let _ = state.set_user_codec(created_id, Codec::Base32);
+    handshake
+        .session_id_by_handshake_user
+        .insert(userid as u32, created_id);
+    handshake.pending_login_challenges.remove(&userid);
+    let payload = format!(
+        "{}-{}-1500-{}",
+        tun_ip,
+        client_ip,
+        ipv4_netmask_prefix(tun_netmask)
+    )
+    .into_bytes();
+    Some(ControlResponse { rr_type, payload })
+}
+
+async fn handle_codec_packet(
+    query: ControlQuery<'_>,
+    state: &ServerState,
+    handshake: &HandshakeState,
+    rr_type: u16,
+) -> Option<ControlResponse> {
+    if query.first_label.len() < 3 {
+        return Some(ControlResponse {
+            rr_type,
+            payload: CONTROL_BADLEN.to_vec(),
+        });
+    }
+    let handshake_user = decode_base32_char(query.first_label[1]).unwrap_or(0) as u32;
+    let session_id = session_id_for(handshake, handshake_user);
+    let codec_id = decode_base32_char(query.first_label[2]).unwrap_or(0);
+    let payload = match codec_id {
+        5 => {
+            let _ = state.set_user_codec(session_id, Codec::Base32);
+            b"Base32".to_vec()
+        }
+        6 => {
+            let _ = state.set_user_codec(session_id, Codec::Base64);
+            let _ = state.set_use_tun_pi(session_id, true);
+            b"Base64".to_vec()
+        }
+        26 => {
+            let _ = state.set_user_codec(session_id, Codec::Base64u);
+            let _ = state.set_use_tun_pi(session_id, true);
+            b"Base64u".to_vec()
+        }
+        7 => {
+            let _ = state.set_user_codec(session_id, Codec::Base128);
+            let _ = state.set_use_tun_pi(session_id, true);
+            b"Base128".to_vec()
+        }
+        _ => b"BADCODEC".to_vec(),
+    };
+    Some(ControlResponse { rr_type, payload })
 }
 
 fn decode_base32_char(ch: u8) -> Option<u8> {

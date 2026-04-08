@@ -27,6 +27,10 @@ use crate::dns::{
     DnsHeader, DnsQuestion, DnsRdata, DnsResourceRecord, DNS_CLASS_IN, DNS_TYPE_NULL,
 };
 use crate::encoding::framing::{DownstreamHeader, UpstreamHeader};
+use crate::protocol::{
+    DNS_PACKET_BUFFER_SIZE, PACKET_PREFIX_LNAK, PACKET_PREFIX_VACK, PACKET_TYPE_LOGIN,
+    PACKET_TYPE_PING, PACKET_TYPE_VERSION, PROTOCOL_VERSION,
+};
 
 #[derive(Debug, Clone, Args)]
 pub struct ClientArgs {
@@ -79,8 +83,8 @@ pub async fn run(args: ClientArgs) {
         .password
         .expect("tunnel password must be provided via --password or IODINE_PASSWORD");
 
-    let mut tun_buf = [0u8; 2048];
-    let mut udp_buf = [0u8; 2048];
+    let mut tun_buf = [0u8; DNS_PACKET_BUFFER_SIZE];
+    let mut udp_buf = [0u8; DNS_PACKET_BUFFER_SIZE];
     let mut state = ClientState {
         topdomain,
         nameserver,
@@ -112,7 +116,8 @@ pub async fn run(args: ClientArgs) {
                         handle_tun_read(&tun_buf[..len], &mut state, &socket).await;
                     }
                     Err(err) => {
-                        warn!(error = %err, "tun read failed");
+                        let typed_err = ClientError::TunError(err.to_string());
+                        warn!(error = %typed_err, "tun read failed");
                     }
                 }
             }
@@ -250,29 +255,11 @@ async fn handle_udp_read(
         }
     };
     let payload = match rr.rdata {
-        DnsRdata::Null(data) => {
-            debug!(
-                rr_type = "NULL",
-                raw_payload_len = data.len(),
-                "downstream rr payload"
-            );
-            data.to_vec()
-        }
-        DnsRdata::Txt(data) => {
-            let txt = flatten_txt_rdata(data);
-            debug!(
-                rr_type = "TXT",
-                raw_payload_len = txt.len(),
-                "downstream rr payload"
-            );
-            match decode_downstream_txt_payload(&txt) {
-                Some(v) => v,
-                None => {
-                    warn!("invalid TXT answer payload encoding");
-                    return;
-                }
-            }
-        }
+        DnsRdata::Null(data) => handle_null_record(data),
+        DnsRdata::Txt(data) => match handle_txt_record(data) {
+            Some(payload) => payload,
+            None => return,
+        },
         _ => return,
     };
     debug!(decoded_payload_len = payload.len(), "downstream rr decoded");
@@ -388,6 +375,33 @@ fn flatten_txt_rdata(data: &[u8]) -> Vec<u8> {
     out
 }
 
+fn handle_null_record(data: &[u8]) -> Vec<u8> {
+    debug!(
+        rr_type = "NULL",
+        raw_payload_len = data.len(),
+        "downstream rr payload"
+    );
+    data.to_vec()
+}
+
+fn handle_txt_record(data: &[u8]) -> Option<Vec<u8>> {
+    let txt = flatten_txt_rdata(data);
+    debug!(
+        rr_type = "TXT",
+        raw_payload_len = txt.len(),
+        "downstream rr payload"
+    );
+    match decode_downstream_txt_payload(&txt) {
+        Some(v) => Some(v),
+        None => {
+            let typed_err =
+                ClientError::EncodingError("invalid TXT answer payload encoding".to_string());
+            warn!(error = %typed_err, "invalid TXT answer payload encoding");
+            None
+        }
+    }
+}
+
 fn decode_base64_payload(encoded: &[u8]) -> Option<Vec<u8>> {
     if encoded.is_empty() {
         return Some(Vec::new());
@@ -499,11 +513,18 @@ enum ClientMode {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[allow(clippy::enum_variant_names)]
 enum ClientError {
-    #[error("io error: {0}")]
-    Io(String),
+    #[error("tun error: {0}")]
+    TunError(String),
+    #[error("udp error: {0}")]
+    UdpError(String),
+    #[error("encoding error: {0}")]
+    EncodingError(String),
+    #[error("dns error: {0}")]
+    DnsError(String),
     #[error("protocol error: {0}")]
-    Protocol(String),
+    ProtocolError(String),
 }
 
 async fn perform_handshake(
@@ -512,7 +533,7 @@ async fn perform_handshake(
     topdomain: &str,
     password: &str,
     dns_id: &mut u16,
-    udp_buf: &mut [u8; 2048],
+    udp_buf: &mut [u8; DNS_PACKET_BUFFER_SIZE],
     session: &mut ClientSession,
 ) -> Result<(), ClientError> {
     let (userid, mode) =
@@ -534,16 +555,16 @@ async fn try_handshake(
     topdomain: &str,
     password: &str,
     dns_id: &mut u16,
-    udp_buf: &mut [u8; 2048],
+    udp_buf: &mut [u8; DNS_PACKET_BUFFER_SIZE],
 ) -> Result<(u8, ClientMode), ClientError> {
     let mut version_payload = [0u8; 6];
-    version_payload[..4].copy_from_slice(&0x0000_0502u32.to_be_bytes());
-    let vname = build_handshake_name('v', &version_payload, topdomain)?;
+    version_payload[..4].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    let vname = build_handshake_name(PACKET_TYPE_VERSION, &version_payload, topdomain)?;
     let version_answer =
         send_and_read_first_answer(socket, nameserver, dns_id, udp_buf, &vname, DNS_TYPE_NULL)
             .await?;
-    if version_answer.len() < 9 || &version_answer[..4] != b"VACK" {
-        return Err(ClientError::Protocol("missing VACK".to_string()));
+    if version_answer.len() < 9 || &version_answer[..4] != PACKET_PREFIX_VACK {
+        return Err(ClientError::ProtocolError("missing VACK".to_string()));
     }
     let seed = u32::from_be_bytes([
         version_answer[4],
@@ -557,12 +578,12 @@ async fn try_handshake(
     let mut login_payload = [0u8; 19];
     login_payload[0] = userid;
     login_payload[1..17].copy_from_slice(&login_hash);
-    let lname = build_handshake_name('l', &login_payload, topdomain)?;
+    let lname = build_handshake_name(PACKET_TYPE_LOGIN, &login_payload, topdomain)?;
     let login_answer =
         send_and_read_first_answer(socket, nameserver, dns_id, udp_buf, &lname, DNS_TYPE_NULL)
             .await?;
-    if login_answer.starts_with(b"LNAK") || login_answer.is_empty() {
-        return Err(ClientError::Protocol("LNAK".to_string()));
+    if login_answer.starts_with(PACKET_PREFIX_LNAK) || login_answer.is_empty() {
+        return Err(ClientError::ProtocolError("LNAK".to_string()));
     }
     let mode = if login_answer.windows(6).any(|w| w == b"-1500-") {
         ClientMode::RustCompat
@@ -572,10 +593,10 @@ async fn try_handshake(
     Ok((userid, mode))
 }
 
-fn build_handshake_name(prefix: char, data: &[u8], topdomain: &str) -> Result<String, ClientError> {
+fn build_handshake_name(prefix: u8, data: &[u8], topdomain: &str) -> Result<String, ClientError> {
     let encoded = crate::encoding::base32::encode(data);
     let encoded = crate::encoding::inline_dotify(&encoded);
-    Ok(format!("{prefix}{encoded}.{topdomain}"))
+    Ok(format!("{}{encoded}.{topdomain}", prefix as char))
 }
 
 async fn send_query(
@@ -586,7 +607,7 @@ async fn send_query(
     dns_id: &mut u16,
 ) -> Result<(), ClientError> {
     let qname_wire = build_qname_wire(qname, "")
-        .ok_or_else(|| ClientError::Protocol("invalid qname".to_string()))?;
+        .ok_or_else(|| ClientError::ProtocolError("invalid qname".to_string()))?;
     send_query_wire(socket, nameserver, &qname_wire, qtype, dns_id).await
 }
 
@@ -597,7 +618,7 @@ async fn send_query_wire(
     qtype: u16,
     dns_id: &mut u16,
 ) -> Result<(), ClientError> {
-    let mut query = BytesMut::with_capacity(2048);
+    let mut query = BytesMut::with_capacity(DNS_PACKET_BUFFER_SIZE);
     DnsHeader {
         id: *dns_id,
         flags: 0x0100,
@@ -617,7 +638,7 @@ async fn send_query_wire(
     socket
         .send_to(&query, nameserver)
         .await
-        .map_err(|e| ClientError::Io(format!("udp send failed: {e}")))?;
+        .map_err(|e| ClientError::UdpError(format!("udp send failed: {e}")))?;
     Ok(())
 }
 
@@ -625,30 +646,30 @@ async fn send_and_read_first_answer(
     socket: &UdpSocket,
     nameserver: SocketAddr,
     dns_id: &mut u16,
-    udp_buf: &mut [u8; 2048],
+    udp_buf: &mut [u8; DNS_PACKET_BUFFER_SIZE],
     qname: &str,
     qtype: u16,
 ) -> Result<Vec<u8>, ClientError> {
     send_query(socket, nameserver, qname, qtype, dns_id).await?;
     let recv = timeout(Duration::from_secs(2), socket.recv_from(udp_buf))
         .await
-        .map_err(|_| ClientError::Protocol("handshake timeout".to_string()))?
-        .map_err(|e| ClientError::Io(format!("udp recv failed: {e}")))?;
+        .map_err(|_| ClientError::ProtocolError("handshake timeout".to_string()))?
+        .map_err(|e| ClientError::UdpError(format!("udp recv failed: {e}")))?;
     let (len, _) = recv;
     let mut cur = Cursor::new(&udp_buf[..len]);
-    let header = DnsHeader::parse(&mut cur)
-        .map_err(|e| ClientError::Protocol(format!("dns header: {e}")))?;
+    let header =
+        DnsHeader::parse(&mut cur).map_err(|e| ClientError::DnsError(format!("dns header: {e}")))?;
     let _question = DnsQuestion::parse(&mut cur)
-        .map_err(|e| ClientError::Protocol(format!("dns question: {e}")))?;
+        .map_err(|e| ClientError::DnsError(format!("dns question: {e}")))?;
     if header.ancount == 0 {
-        return Err(ClientError::Protocol("ancount=0".to_string()));
+        return Err(ClientError::ProtocolError("ancount=0".to_string()));
     }
     let rr = DnsResourceRecord::parse(&mut cur)
-        .map_err(|e| ClientError::Protocol(format!("dns answer: {e}")))?;
+        .map_err(|e| ClientError::DnsError(format!("dns answer: {e}")))?;
     match rr.rdata {
         DnsRdata::Null(data) => Ok(data.to_vec()),
         DnsRdata::Txt(data) => Ok(flatten_txt_rdata(data)),
-        _ => Err(ClientError::Protocol(
+        _ => Err(ClientError::ProtocolError(
             "unsupported handshake rr".to_string(),
         )),
     }
@@ -704,7 +725,7 @@ async fn send_c_ping(
     *rand_seed = rand_seed.wrapping_add(1);
     let encoded = crate::encoding::base32::encode(&payload);
     let encoded = crate::encoding::inline_dotify(&encoded);
-    let qname = format!("p{encoded}.{topdomain}");
+    let qname = format!("{}{encoded}.{topdomain}", PACKET_TYPE_PING as char);
     send_query(socket, nameserver, &qname, DNS_TYPE_NULL, dns_id).await
 }
 
